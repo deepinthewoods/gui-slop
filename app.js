@@ -47,7 +47,14 @@ const els = {
   sliceLengthOut: document.getElementById("sliceLengthOut"),
   areaStats: document.getElementById("areaStats"),
   selectionStats: document.getElementById("selectionStats"),
+  processSliceReadout: document.getElementById("processSliceReadout"),
+  processInsidePx: document.getElementById("processInsidePx"),
+  processOutsidePx: document.getElementById("processOutsidePx"),
+  processStatus: document.getElementById("processStatus"),
+  resetSliceProcessBtn: document.getElementById("resetSliceProcessBtn"),
+  resetFrameProcessBtn: document.getElementById("resetFrameProcessBtn"),
   previewGrid: document.getElementById("previewGrid"),
+  downloadAllBtn: document.getElementById("downloadAllBtn"),
   downloadCropBtn: document.getElementById("downloadCropBtn"),
   downloadSheetBtn: document.getElementById("downloadSheetBtn"),
   downloadJsonBtn: document.getElementById("downloadJsonBtn"),
@@ -66,8 +73,14 @@ const state = {
   sourceHasAlpha: false,
   frames: [],
   selectedId: null,
+  selectedSlice: null,
   patches: new Map(),
   edgeAreas: new Map(),
+  frameSettings: new Map(),
+  processedPatches: new Map(),
+  processedCanvas: document.createElement("canvas"),
+  hasProcessedPatches: false,
+  processingBusy: false,
   sliceScans: new Map(),
   repeatScans: new Map(),
   manualMode: false,
@@ -78,6 +91,18 @@ const state = {
 };
 
 const EDGE_SIDES = ["top", "bottom", "left", "right"];
+const AUTO_AREA_MODES = new Set(["stable", "compact", "cornerSafe", "cornerSafeExpanded", "projection", "sliceScan"]);
+const PROCESS_PRESETS = {
+  fastAverage: "Fast Avg",
+  fastMedian: "Fast Median",
+  patchSmall: "Patch Small",
+  patchStrong: "Patch Strong",
+  matchPatch: "MatchPatch",
+  pdeSmooth: "PDE Smooth",
+  morphological: "Morpho",
+};
+const STORAGE_KEY = "frame-patch-lab:v2";
+let pendingSaveTimer = null;
 
 const sourceCtx = els.sourceCanvas.getContext("2d", { willReadFrequently: true });
 const editorCtx = els.editorCanvas.getContext("2d", { willReadFrequently: true });
@@ -186,6 +211,7 @@ function initImageOptions() {
 }
 
 function loadImage(src, name) {
+  flushPendingSave();
   setStatus(`Loading ${name}...`);
   const img = new Image();
   img.onload = () => {
@@ -206,6 +232,9 @@ function loadImage(src, name) {
     state.frames = [];
     state.patches.clear();
     state.edgeAreas.clear();
+    state.frameSettings.clear();
+    state.selectedSlice = null;
+    clearProcessedPatches(false);
     state.sliceScans.clear();
     state.repeatScans.clear();
     state.selectedId = null;
@@ -214,6 +243,7 @@ function loadImage(src, name) {
     const roleColors = sampleRoleColors(state.originalData);
     els.mainColor.value = rgbToHex(roleColors.main);
     els.secondaryColor.value = rgbToHex(roleColors.secondary);
+    applyUiSettings(getStoredImageRecord()?.settings);
     setStatus(`${name} loaded, ${img.naturalWidth}x${img.naturalHeight}`);
     processImage();
     detectFrames();
@@ -354,6 +384,7 @@ function processImage() {
   };
   state.keyedCanvas.getContext("2d").putImageData(out, 0, 0);
   state.maskCanvas.getContext("2d").putImageData(mask, 0, 0);
+  clearProcessedPatches(false);
   renderAll();
 }
 
@@ -371,6 +402,355 @@ function updateControlLabels() {
   if (els.sliceLengthOut) els.sliceLengthOut.value = `${els.sliceLengthLimit.value} px`;
 }
 
+function getRenderCanvas() {
+  return state.hasProcessedPatches ? state.processedCanvas : state.keyedCanvas;
+}
+
+function syncProcessedCanvasSize() {
+  if (state.processedCanvas.width !== state.keyedCanvas.width) state.processedCanvas.width = state.keyedCanvas.width;
+  if (state.processedCanvas.height !== state.keyedCanvas.height) state.processedCanvas.height = state.keyedCanvas.height;
+}
+
+function rebuildProcessedCanvas(shouldRender = true) {
+  syncProcessedCanvasSize();
+  const ctx = state.processedCanvas.getContext("2d");
+  ctx.clearRect(0, 0, state.processedCanvas.width, state.processedCanvas.height);
+  ctx.drawImage(state.keyedCanvas, 0, 0);
+  for (const patch of state.processedPatches.values()) {
+    ctx.drawImage(patch.canvas, patch.x, patch.y);
+  }
+  state.hasProcessedPatches = state.processedPatches.size > 0;
+  if (shouldRender) renderAll();
+}
+
+function clearProcessedPatches(shouldRender = true) {
+  state.processedPatches.clear();
+  state.hasProcessedPatches = false;
+  syncProcessedCanvasSize();
+  state.processedCanvas.getContext("2d").clearRect(0, 0, state.processedCanvas.width, state.processedCanvas.height);
+  if (shouldRender) renderAll();
+}
+
+function clearProcessedFrame(frameId, shouldRender = true) {
+  for (const key of [...state.processedPatches.keys()]) {
+    if (key.startsWith(`${frameId}:`)) state.processedPatches.delete(key);
+  }
+  rebuildProcessedCanvas(shouldRender);
+}
+
+function clearProcessedSlice(frameId, side, index, shouldRender = true) {
+  state.processedPatches.delete(slicePatchKey(frameId, side, index));
+  rebuildProcessedCanvas(shouldRender);
+}
+
+function setInputValue(input, value) {
+  if (!input || value === undefined || value === null) return;
+  input.value = String(value);
+}
+
+function syncModeButtons(selector, attr, activeValue) {
+  document.querySelectorAll(selector).forEach((button) => {
+    button.classList.toggle("active", button.dataset[attr] === activeValue);
+  });
+}
+
+function normalizeAutoMode(mode) {
+  return AUTO_AREA_MODES.has(mode) ? mode : "stable";
+}
+
+function getUiSettings() {
+  return {
+    colors: {
+      mainColor: els.mainColor.value,
+      mainTint: Number(els.mainTint.value),
+      mainDesaturate: Number(els.mainDesaturate.value),
+      secondaryColor: els.secondaryColor.value,
+      secondaryTint: Number(els.secondaryTint.value),
+      secondaryDesaturate: Number(els.secondaryDesaturate.value),
+    },
+    detection: {
+      alphaThreshold: Number(els.alphaThreshold.value),
+      mergeGap: Number(els.mergeGap.value),
+      framePadding: Number(els.framePadding.value),
+      minArea: Number(els.minArea.value),
+    },
+    areas: {
+      autoMode: state.autoMode,
+      sliceThreshold: Number(els.sliceThreshold.value),
+      sliceBridgeGap: Number(els.sliceBridgeGap.value),
+      sliceCornerGuard: Number(els.sliceCornerGuard.value),
+      sliceLengthLimit: Number(els.sliceLengthLimit.value),
+    },
+    previewMode: state.previewMode,
+  };
+}
+
+function applyUiSettings(settings) {
+  if (!settings) return;
+  setInputValue(els.mainColor, settings.colors?.mainColor);
+  setInputValue(els.mainTint, settings.colors?.mainTint);
+  setInputValue(els.mainDesaturate, settings.colors?.mainDesaturate);
+  setInputValue(els.secondaryColor, settings.colors?.secondaryColor);
+  setInputValue(els.secondaryTint, settings.colors?.secondaryTint);
+  setInputValue(els.secondaryDesaturate, settings.colors?.secondaryDesaturate);
+  setInputValue(els.alphaThreshold, settings.detection?.alphaThreshold);
+  setInputValue(els.mergeGap, settings.detection?.mergeGap);
+  setInputValue(els.framePadding, settings.detection?.framePadding);
+  setInputValue(els.minArea, settings.detection?.minArea);
+  setInputValue(els.sliceThreshold, settings.areas?.sliceThreshold);
+  setInputValue(els.sliceBridgeGap, settings.areas?.sliceBridgeGap);
+  setInputValue(els.sliceCornerGuard, settings.areas?.sliceCornerGuard);
+  setInputValue(els.sliceLengthLimit, settings.areas?.sliceLengthLimit);
+  if (settings.areas?.autoMode) state.autoMode = normalizeAutoMode(settings.areas.autoMode);
+  if (settings.previewMode) state.previewMode = settings.previewMode;
+  syncModeButtons("[data-auto-mode]", "autoMode", state.autoMode);
+  syncModeButtons("[data-preview-mode]", "previewMode", state.previewMode);
+  updateControlLabels();
+}
+
+function readStorageRoot() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY)) || { images: {} };
+  } catch {
+    return { images: {} };
+  }
+}
+
+function writeStorageRoot(root) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(root));
+  } catch {
+    setStatus("Could not save settings in this browser session.");
+  }
+}
+
+function getStoredImageRecord(root = readStorageRoot()) {
+  return root.images?.[state.imageName] || null;
+}
+
+function getWritableImageRecord(root) {
+  root.images ||= {};
+  root.images[state.imageName] ||= { settings: null, frames: {} };
+  root.images[state.imageName].frames ||= {};
+  return root.images[state.imageName];
+}
+
+function frameStorageKey(frame) {
+  return [frame.x, frame.y, frame.w, frame.h].map((value) => Math.round(value)).join(",");
+}
+
+function serializeRunCollection(collection) {
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    const runs = collection?.[side] || [];
+    if (runs.length > 0) out[side] = runs.map(rectToArray);
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function serializeRectMap(rects) {
+  const out = {};
+  for (const [side, rect] of Object.entries(rects || {})) {
+    if (rect) out[side] = rectToArray(rect);
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function serializeSideFlags(flags) {
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    if (flags?.[side] === true) out[side] = true;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function serializePatchForStorage(patch) {
+  if (!patch) return null;
+  return {
+    v: { ...patch.v },
+    h: { ...patch.h },
+    mode: patch.mode || "tile",
+  };
+}
+
+function serializeAreasForStorage(areas) {
+  if (!areas) return null;
+  return {
+    center: rectToArray(areas.center),
+    top: rectToArray(areas.top),
+    bottom: rectToArray(areas.bottom),
+    left: rectToArray(areas.left),
+    right: rectToArray(areas.right),
+    tileRuns: serializeRunCollection(areas.tileRuns),
+    fixedRuns: serializeRunCollection(areas.fixedRuns),
+    fixedRunsExplicit: areas.fixedRunsExplicit === true,
+    fixedRunsExplicitSides: serializeSideFlags(areas.fixedRunsExplicitSides),
+    medallions: serializeRectMap(areas.medallions),
+  };
+}
+
+function rectFromArray(value) {
+  if (!Array.isArray(value) || value.length !== 4) return null;
+  const rect = {
+    x: Number(value[0]),
+    y: Number(value[1]),
+    w: Number(value[2]),
+    h: Number(value[3]),
+  };
+  return Object.values(rect).every(Number.isFinite) && rect.w > 0 && rect.h > 0 ? rect : null;
+}
+
+function deserializeRunCollection(value) {
+  if (!value || typeof value !== "object") return null;
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    const runs = Array.isArray(value[side]) ? value[side].map(rectFromArray).filter(Boolean) : [];
+    if (runs.length > 0) out[side] = runs;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function deserializeRectMap(value) {
+  if (!value || typeof value !== "object") return null;
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    const rect = rectFromArray(value[side]);
+    if (rect) out[side] = rect;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function deserializeSideFlags(value) {
+  if (!value || typeof value !== "object") return null;
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    if (value[side] === true) out[side] = true;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function deserializePatchForStorage(frame, value) {
+  if (!value?.v || !value?.h) return null;
+  const patch = {
+    v: { ...value.v },
+    h: { ...value.h },
+    mode: value.mode || "tile",
+  };
+  return constrainPatch(frame, patch);
+}
+
+function deserializeAreasForStorage(frame, value) {
+  if (!value) return null;
+  const center = rectFromArray(value.center);
+  const top = rectFromArray(value.top);
+  const bottom = rectFromArray(value.bottom);
+  const left = rectFromArray(value.left);
+  const right = rectFromArray(value.right);
+  if (!center || !top || !bottom || !left || !right) return null;
+  const areas = {
+    center,
+    top,
+    bottom,
+    left,
+    right,
+    tileRuns: deserializeRunCollection(value.tileRuns),
+    fixedRuns: deserializeRunCollection(value.fixedRuns),
+    fixedRunsExplicit: value.fixedRunsExplicit === true,
+    fixedRunsExplicitSides: deserializeSideFlags(value.fixedRunsExplicitSides),
+    medallions: deserializeRectMap(value.medallions),
+  };
+  return constrainEdgeAreas(frame, areas);
+}
+
+function rememberFrameSettings(frame = getSelectedFrame()) {
+  if (!frame) return;
+  state.frameSettings.set(frame.id, getUiSettings());
+}
+
+function saveCurrentImageState() {
+  if (!state.imageName) return;
+  const root = readStorageRoot();
+  const record = getWritableImageRecord(root);
+  record.settings = getUiSettings();
+  const selected = getSelectedFrame();
+  record.selectedFrameKey = selected ? frameStorageKey(selected) : record.selectedFrameKey || null;
+  for (const frame of state.frames) {
+    const areas = state.edgeAreas.get(frame.id);
+    const patch = state.patches.get(frame.id);
+    if (!areas && !patch) continue;
+    const key = frameStorageKey(frame);
+    record.frames[key] = {
+      name: frame.name,
+      sourceRect: [frame.x, frame.y, frame.w, frame.h],
+      manual: frame.id.startsWith("manual"),
+      patch: serializePatchForStorage(patch),
+      areas: serializeAreasForStorage(areas),
+      settings: state.frameSettings.get(frame.id) || record.frames[key]?.settings || getUiSettings(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  writeStorageRoot(root);
+}
+
+function scheduleSaveCurrentImageState() {
+  clearTimeout(pendingSaveTimer);
+  pendingSaveTimer = setTimeout(() => {
+    pendingSaveTimer = null;
+    saveCurrentImageState();
+  }, 120);
+}
+
+function flushPendingSave() {
+  if (!pendingSaveTimer) return;
+  clearTimeout(pendingSaveTimer);
+  pendingSaveTimer = null;
+  saveCurrentImageState();
+}
+
+function restoreSavedManualFrames() {
+  const record = getStoredImageRecord();
+  if (!record?.frames) return;
+  const existing = new Set(state.frames.map(frameStorageKey));
+  let restoredCount = 0;
+  for (const saved of Object.values(record.frames)) {
+    if (!saved?.manual) continue;
+    const rect = rectFromArray(saved.sourceRect);
+    if (!rect || existing.has(frameStorageKey(rect))) continue;
+    const frame = {
+      id: `manual_saved_${restoredCount + 1}`,
+      name: saved.name || `Manual ${restoredCount + 1}`,
+      x: clamp(rect.x, 0, state.keyedData.width - 1),
+      y: clamp(rect.y, 0, state.keyedData.height - 1),
+      w: clamp(rect.w, 1, state.keyedData.width - rect.x),
+      h: clamp(rect.h, 1, state.keyedData.height - rect.y),
+      area: rect.w * rect.h,
+    };
+    state.frames.push(frame);
+    existing.add(frameStorageKey(frame));
+    restoredCount += 1;
+  }
+  if (restoredCount > 0) state.frames.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+}
+
+function restoreSavedFrameSettings(previousSelectedKey = null) {
+  const record = getStoredImageRecord();
+  if (!record?.frames) return null;
+  const preferredKey = previousSelectedKey || record.selectedFrameKey || null;
+  let restoredSelectedId = null;
+  for (const frame of state.frames) {
+    const saved = record.frames[frameStorageKey(frame)];
+    if (!saved) continue;
+    if (saved.name) frame.name = saved.name;
+    const patch = deserializePatchForStorage(frame, saved.patch);
+    if (patch) state.patches.set(frame.id, patch);
+    const areas = deserializeAreasForStorage(frame, saved.areas);
+    if (areas) state.edgeAreas.set(frame.id, areas);
+    state.frameSettings.set(frame.id, saved.settings || record.settings || getUiSettings());
+    if (preferredKey && frameStorageKey(frame) === preferredKey) restoredSelectedId = frame.id;
+  }
+  return restoredSelectedId;
+}
+
 function detectExistingAlpha(imageData) {
   const data = imageData.data;
   let transparentish = 0;
@@ -384,6 +764,7 @@ function detectExistingAlpha(imageData) {
 function detectFrames() {
   if (!state.keyedData) return;
   updateControlLabels();
+  const previousSelectedKey = getSelectedFrame() ? frameStorageKey(getSelectedFrame()) : null;
   state.sliceScans.clear();
   state.repeatScans.clear();
   const width = state.keyedData.width;
@@ -466,11 +847,21 @@ function detectFrames() {
       state.patches.set(frame.id, suggestPatch(frame));
     }
     state.edgeAreas.set(frame.id, suggestEdgeAreas(frame));
+    state.frameSettings.set(frame.id, getUiSettings());
   });
 
-  state.selectedId = state.frames[0]?.id || null;
+  restoreSavedManualFrames();
+  state.frames.forEach((frame) => {
+    if (!state.patches.has(frame.id)) state.patches.set(frame.id, suggestPatch(frame));
+    if (!state.edgeAreas.has(frame.id)) state.edgeAreas.set(frame.id, suggestEdgeAreas(frame));
+    if (!state.frameSettings.has(frame.id)) state.frameSettings.set(frame.id, getUiSettings());
+  });
+  const restoredSelectedId = restoreSavedFrameSettings(previousSelectedKey);
+  state.selectedId = restoredSelectedId || state.frames[0]?.id || null;
+  clearSelectedSlice(false);
   setStatus(`${state.imageName}: detected ${state.frames.length} frame${state.frames.length === 1 ? "" : "s"}`);
   renderAll();
+  scheduleSaveCurrentImageState();
 }
 
 function mergeComponents(components, gap, labels, width, height) {
@@ -566,8 +957,95 @@ function getSelectedAreas() {
   return frame ? state.edgeAreas.get(frame.id) : null;
 }
 
+function slicePatchKey(frameId, side, index = "area") {
+  return `${frameId}:${side}:${index ?? "area"}`;
+}
+
+function getSelectedSliceRun() {
+  const frame = getSelectedFrame();
+  const areas = getSelectedAreas();
+  const selection = state.selectedSlice;
+  if (!frame || !areas || !selection || selection.frameId !== frame.id) return null;
+  const isAreaSelection = selection.kind === "area";
+  const rect = isAreaSelection
+    ? areas[selection.side]
+    : areas.tileRuns?.[selection.side]?.[selection.index];
+  if (!rect) return null;
+  const index = isAreaSelection ? null : selection.index;
+  return {
+    frame,
+    areas,
+    side: selection.side,
+    index,
+    kind: isAreaSelection ? "area" : "slice",
+    name: isAreaSelection ? `${selection.side} area` : `${selection.side} slice ${selection.index + 1}`,
+    rect,
+    key: slicePatchKey(frame.id, selection.side, index),
+  };
+}
+
+function selectSliceHit(hit, shouldRender = true) {
+  const frame = getSelectedFrame();
+  if (!frame || !hit || hit.kind !== "slice") return;
+  state.selectedSlice = { frameId: frame.id, side: hit.side, index: hit.index, kind: "slice" };
+  if (shouldRender) renderAll();
+}
+
+function selectAreaSliceHit(hit, shouldRender = true) {
+  const frame = getSelectedFrame();
+  if (!frame || !hit || hit.kind !== "area") return;
+  state.selectedSlice = { frameId: frame.id, side: hit.side, index: null, kind: "area" };
+  if (shouldRender) renderAll();
+}
+
+function clearSelectedSlice(shouldRender = true) {
+  if (!state.selectedSlice) return;
+  state.selectedSlice = null;
+  if (shouldRender) renderAll();
+}
+
 function cloneRect(rect) {
   return { x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+}
+
+function cloneRunCollection(collection) {
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    const runs = collection?.[side] || [];
+    if (runs.length > 0) out[side] = runs.map(cloneRect);
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function cloneRectMap(rects) {
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    if (rects?.[side]) out[side] = cloneRect(rects[side]);
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function cloneSideFlags(flags) {
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    if (flags?.[side] === true) out[side] = true;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function cloneAreas(areas) {
+  return {
+    center: cloneRect(areas.center),
+    top: cloneRect(areas.top),
+    bottom: cloneRect(areas.bottom),
+    left: cloneRect(areas.left),
+    right: cloneRect(areas.right),
+    tileRuns: cloneRunCollection(areas.tileRuns),
+    fixedRuns: cloneRunCollection(areas.fixedRuns),
+    fixedRunsExplicit: areas.fixedRunsExplicit === true,
+    fixedRunsExplicitSides: cloneSideFlags(areas.fixedRunsExplicitSides),
+    medallions: cloneRectMap(areas.medallions),
+  };
 }
 
 function rectToArray(rect) {
@@ -890,6 +1368,9 @@ function constrainEdgeAreas(frame, areas) {
     left: normalizeRect(frame, areas.left || sideDefaultRect(frame, center, "left"), 1),
     right: normalizeRect(frame, areas.right || sideDefaultRect(frame, center, "right"), 1),
   };
+  if (areas.fixedRunsExplicit === true) constrained.fixedRunsExplicit = true;
+  const explicitFixedSides = areas.fixedRunsExplicitSides || {};
+  const constrainedExplicitFixedSides = {};
   const sourceTileRuns = areas.tileRuns || {};
   const tileRuns = {};
   for (const side of ["top", "bottom", "left", "right"]) {
@@ -905,10 +1386,11 @@ function constrainEdgeAreas(frame, areas) {
   if (Object.keys(tileRuns).length > 0) constrained.tileRuns = tileRuns;
   const sourceFixedRuns = areas.fixedRuns || {};
   const sourceMedallions = areas.medallions || {};
-  const useExplicitFixedRuns = areas.fixedRunsExplicit === true;
   const fixedRuns = {};
   for (const side of ["top", "bottom", "left", "right"]) {
     const axis = sideAxis(side);
+    const useExplicitFixedRuns = areas.fixedRunsExplicit === true || explicitFixedSides[side] === true;
+    if (explicitFixedSides[side] === true) constrainedExplicitFixedSides[side] = true;
     const gapRuns = fixedRunsForTileGaps(constrained[side], tileRuns[side] || [], axis);
     const sourceRuns = [
       ...(sourceFixedRuns[side] || []),
@@ -922,6 +1404,7 @@ function constrainEdgeAreas(frame, areas) {
     const mergedRuns = mergeFixedRunsForArea(normalizedRuns, axis);
     if (mergedRuns.length > 0) fixedRuns[side] = mergedRuns;
   }
+  if (Object.keys(constrainedExplicitFixedSides).length > 0) constrained.fixedRunsExplicitSides = constrainedExplicitFixedSides;
   if (Object.keys(fixedRuns).length > 0) constrained.fixedRuns = fixedRuns;
   const medallions = representativeFixedMedallions(fixedRuns, constrained);
   if (Object.keys(medallions).length > 0) constrained.medallions = medallions;
@@ -1259,23 +1742,7 @@ function sideAreaFromRepeatScan(frame, center, side, scan) {
 function buildRepeatScanTileRuns(areas, scans) {
   const tileRuns = {};
   for (const side of EDGE_SIDES) {
-    const scan = scans[side];
-    const area = areas[side];
-    if (!scan || !area) continue;
-    const horizontal = side === "top" || side === "bottom";
-    const areaStart = horizontal ? area.x : area.y;
-    const areaEnd = horizontal ? rectEndX(area) : rectEndY(area);
-    const minSize = Math.max(2, Math.round((areaEnd - areaStart) * 0.015));
-    const sourceRuns = scan.period ? representativeRepeatRuns(scan.repeatableRuns) : scan.stableRuns;
-    const runs = sourceRuns
-      .map((run) => ({
-        start: clamp(run.start, areaStart, areaEnd),
-        end: clamp(run.end, areaStart, areaEnd),
-      }))
-      .filter((run) => run.end - run.start >= minSize)
-      .map((run) => horizontal
-        ? { x: run.start, y: area.y, w: run.end - run.start, h: area.h }
-        : { x: area.x, y: run.start, w: area.w, h: run.end - run.start });
+    const runs = repeatScanTileRunsForSide(areas[side], scans[side], side);
     if (runs.length > 0) tileRuns[side] = runs;
   }
   return tileRuns;
@@ -1284,17 +1751,37 @@ function buildRepeatScanTileRuns(areas, scans) {
 function buildRepeatScanFixedRuns(areas, scans) {
   const fixedRuns = {};
   for (const side of EDGE_SIDES) {
-    const area = areas[side];
-    if (!area) continue;
-    const axis = sideAxis(side);
-    const scan = scans[side];
-    const runs = scan?.period
-      ? fixedRunsBetweenRepeatGroups(area, scan.repeatableRuns, axis)
-      : fixedRunsForTileGaps(area, areas.tileRuns?.[side] || [], axis);
-    const mergedRuns = mergeFixedRunsForArea(runs, axis);
+    const mergedRuns = repeatScanFixedRunsForSide(areas[side], scans[side], areas.tileRuns?.[side] || [], side);
     if (mergedRuns.length > 0) fixedRuns[side] = mergedRuns;
   }
   return fixedRuns;
+}
+
+function repeatScanTileRunsForSide(area, scan, side) {
+  if (!scan || !area) return [];
+  const horizontal = side === "top" || side === "bottom";
+  const areaStart = horizontal ? area.x : area.y;
+  const areaEnd = horizontal ? rectEndX(area) : rectEndY(area);
+  const minSize = Math.max(2, Math.round((areaEnd - areaStart) * 0.015));
+  const sourceRuns = scan.period ? representativeRepeatRuns(scan.repeatableRuns) : scan.stableRuns;
+  return sourceRuns
+    .map((run) => ({
+      start: clamp(run.start, areaStart, areaEnd),
+      end: clamp(run.end, areaStart, areaEnd),
+    }))
+    .filter((run) => run.end - run.start >= minSize)
+    .map((run) => horizontal
+      ? { x: run.start, y: area.y, w: run.end - run.start, h: area.h }
+      : { x: area.x, y: run.start, w: area.w, h: run.end - run.start });
+}
+
+function repeatScanFixedRunsForSide(area, scan, tileRuns, side) {
+  if (!area) return [];
+  const axis = sideAxis(side);
+  const runs = scan?.period
+    ? fixedRunsBetweenRepeatGroups(area, scan.repeatableRuns, axis)
+    : fixedRunsForTileGaps(area, tileRuns || [], axis);
+  return mergeFixedRunsForArea(runs, axis);
 }
 
 function representativeRepeatRuns(runs) {
@@ -2465,6 +2952,7 @@ function renderAll() {
   renderFrameList();
   drawEditor();
   bindAreaInputs();
+  renderProcessingPane();
   renderPreviews();
 }
 
@@ -2489,7 +2977,7 @@ function drawSource() {
     ctx.drawImage(state.maskCanvas, 0, 0);
   } else {
     drawChecker(ctx, canvas.width, canvas.height, 16);
-    ctx.drawImage(state.keyedCanvas, 0, 0);
+    ctx.drawImage(getRenderCanvas(), 0, 0);
   }
 
   ctx.save();
@@ -2514,7 +3002,9 @@ function renderFrameList() {
     item.type = "button";
     item.className = `frame-item${frame.id === state.selectedId ? " selected" : ""}`;
     item.addEventListener("click", () => {
+      if (state.selectedId !== frame.id) clearSelectedSlice(false);
       state.selectedId = frame.id;
+      scheduleSaveCurrentImageState();
       renderAll();
     });
     const canvas = document.createElement("canvas");
@@ -2525,7 +3015,7 @@ function renderFrameList() {
     const scale = Math.min(canvas.width / frame.w, canvas.height / frame.h);
     const w = Math.max(1, frame.w * scale);
     const h = Math.max(1, frame.h * scale);
-    ctx.drawImage(state.keyedCanvas, frame.x, frame.y, frame.w, frame.h, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+    ctx.drawImage(getRenderCanvas(), frame.x, frame.y, frame.w, frame.h, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
     const label = document.createElement("span");
     label.textContent = `${frame.name} ${frame.w}x${frame.h}`;
     item.append(canvas, label);
@@ -2548,17 +3038,18 @@ function drawEditor() {
   resizeCanvasBitmap(els.editorCanvas, frame.w, frame.h);
   setCanvasDisplayScale(els.editorCanvas, frame.w, frame.h, 2);
   drawChecker(editorCtx, frame.w, frame.h, 10);
-  editorCtx.drawImage(state.keyedCanvas, frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
+  editorCtx.drawImage(getRenderCanvas(), frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
 
   editorCtx.save();
   editorCtx.lineWidth = Math.max(1, Math.ceil(Math.max(frame.w, frame.h) / 380));
   drawAreaRect(editorCtx, areas.center, "#d1a943", [8, 5], "center");
-  drawAreaRect(editorCtx, areas.top, "#67a8ff", [], "top");
-  drawAreaRect(editorCtx, areas.bottom, "#67a8ff", [], "bottom");
-  drawAreaRect(editorCtx, areas.left, "#83bd6b", [], "left");
-  drawAreaRect(editorCtx, areas.right, "#83bd6b", [], "right");
+  drawEdgeAreaRect(editorCtx, areas, "top", "#67a8ff");
+  drawEdgeAreaRect(editorCtx, areas, "bottom", "#67a8ff");
+  drawEdgeAreaRect(editorCtx, areas, "left", "#83bd6b");
+  drawEdgeAreaRect(editorCtx, areas, "right", "#83bd6b");
   drawTileRuns(editorCtx, areas.tileRuns || {});
   drawFixedRuns(editorCtx, areas.fixedRuns || {}, areas.medallions || {});
+  drawSelectedSliceOutline(editorCtx);
   editorCtx.restore();
 
   const insets = getEdgeInsets(frame, areas);
@@ -2578,6 +3069,15 @@ function drawEditor() {
     `Left ${formatRect(areas.left)} / Right ${formatRect(areas.right)}`,
     `Source area ${frame.area.toLocaleString()} px`,
   ].join("<br>");
+}
+
+function sideHasTileRuns(areas, side) {
+  return (areas.tileRuns?.[side] || []).length > 0;
+}
+
+function drawEdgeAreaRect(ctx, areas, side, color) {
+  if (sideHasTileRuns(areas, side)) return;
+  drawAreaRect(ctx, areas[side], color, [], side);
 }
 
 function drawAreaRect(ctx, rect, color, dash, label) {
@@ -2624,6 +3124,21 @@ function drawTileRuns(ctx, tileRuns) {
   ctx.restore();
 }
 
+function drawSelectedSliceOutline(ctx) {
+  const selected = getSelectedSliceRun();
+  if (!selected) return;
+  const rect = selected.rect;
+  ctx.save();
+  ctx.setLineDash([]);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#eef2e4";
+  ctx.strokeRect(rect.x - 1.5, rect.y - 1.5, rect.w + 3, rect.h + 3);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "#10130e";
+  ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, Math.max(0, rect.w - 1), Math.max(0, rect.h - 1));
+  ctx.restore();
+}
+
 function drawFixedRuns(ctx, fixedRuns, medallions) {
   const hasFixedRuns = Object.values(fixedRuns).some((runs) => runs.length > 0);
   if (hasFixedRuns) {
@@ -2635,7 +3150,7 @@ function drawFixedRuns(ctx, fixedRuns, medallions) {
     for (const [side, runs] of Object.entries(fixedRuns)) {
       runs.forEach((rect, index) => {
         const label = runs.length === 1 ? `${side} medallion` : `${side} medallion ${index + 1}`;
-        drawEditableRunRect(ctx, side, rect, label, false, "#ffb1b1");
+        drawEditableRunRect(ctx, side, rect, label, true, "#ffb1b1");
       });
     }
     ctx.restore();
@@ -2677,7 +3192,7 @@ function drawMedallions(ctx, medallions) {
   ctx.fillStyle = "rgba(255, 109, 109, 0.13)";
   ctx.setLineDash([4, 3]);
   for (const [side, rect] of Object.entries(medallions || {})) {
-    drawEditableRunRect(ctx, side, rect, `${side} medallion`, false, "#ffb1b1");
+    drawEditableRunRect(ctx, side, rect, `${side} medallion`, true, "#ffb1b1");
   }
   ctx.restore();
 }
@@ -2732,6 +3247,29 @@ function bindAreaInputs() {
     input.max = name === "x" || name === "w" ? frame.w : frame.h;
     input.value = areas[side][name];
   });
+}
+
+function renderProcessingPane() {
+  const selected = getSelectedSliceRun();
+  const frame = getSelectedFrame();
+  if (els.processSliceReadout) {
+    els.processSliceReadout.innerHTML = selected
+      ? `<strong>${selected.frame.name}</strong> ${selected.name}<br>${formatRect(selected.rect)}`
+      : "Select a slice or side area in Areas.";
+  }
+  const controlsDisabled = state.processingBusy || !selected;
+  document.querySelectorAll("[data-process-preset]").forEach((button) => {
+    button.disabled = controlsDisabled;
+  });
+  if (els.processInsidePx) els.processInsidePx.disabled = state.processingBusy;
+  if (els.processOutsidePx) els.processOutsidePx.disabled = state.processingBusy;
+  if (els.resetSliceProcessBtn) {
+    els.resetSliceProcessBtn.disabled = state.processingBusy || !selected || !state.processedPatches.has(selected.key);
+  }
+  if (els.resetFrameProcessBtn) {
+    const hasFramePatch = Boolean(frame && [...state.processedPatches.keys()].some((key) => key.startsWith(`${frame.id}:`)));
+    els.resetFrameProcessBtn.disabled = state.processingBusy || !hasFramePatch;
+  }
 }
 
 function renderPreviews() {
@@ -2853,7 +3391,7 @@ function renderEdgeFrame(ctx, frame, areas, dw, dh, mode, variant = "full") {
   const drawSource = (source, dest) => {
     if (source.w <= 0 || source.h <= 0 || dest.w <= 0 || dest.h <= 0) return;
     ctx.drawImage(
-      state.keyedCanvas,
+      getRenderCanvas(),
       frame.x + source.x,
       frame.y + source.y,
       source.w,
@@ -3111,7 +3649,7 @@ function drawEdgeArea(ctx, frame, area, dest, axis, mode, tileRuns = []) {
   };
   if (src.w <= 0 || src.h <= 0 || dest.w <= 0 || dest.h <= 0) return;
   if (mode === "stretch") {
-    ctx.drawImage(state.keyedCanvas, src.x, src.y, src.w, src.h, dest.x, dest.y, dest.w, dest.h);
+    ctx.drawImage(getRenderCanvas(), src.x, src.y, src.w, src.h, dest.x, dest.y, dest.w, dest.h);
   } else if (tileRuns.length > 0) {
     drawTiledEdgeRuns(ctx, frame, tileRuns, dest, axis, mode === "mirror");
   } else {
@@ -3192,15 +3730,15 @@ function drawTiledEdgeRuns(ctx, frame, runs, dest, axis, mirror) {
       if (horizontal) {
         ctx.translate(draw.x + draw.w, draw.y);
         ctx.scale(-1, 1);
-        ctx.drawImage(state.keyedCanvas, frame.x + run.x + run.w - sourceSize, source.y, sourceSize, source.h, 0, 0, draw.w, draw.h);
+        ctx.drawImage(getRenderCanvas(), frame.x + run.x + run.w - sourceSize, source.y, sourceSize, source.h, 0, 0, draw.w, draw.h);
       } else {
         ctx.translate(draw.x, draw.y + draw.h);
         ctx.scale(1, -1);
-        ctx.drawImage(state.keyedCanvas, source.x, frame.y + run.y + run.h - sourceSize, source.w, sourceSize, 0, 0, draw.w, draw.h);
+        ctx.drawImage(getRenderCanvas(), source.x, frame.y + run.y + run.h - sourceSize, source.w, sourceSize, 0, 0, draw.w, draw.h);
       }
       ctx.restore();
     } else {
-      ctx.drawImage(state.keyedCanvas, source.x, source.y, source.w, source.h, draw.x, draw.y, draw.w, draw.h);
+      ctx.drawImage(getRenderCanvas(), source.x, source.y, source.w, source.h, draw.x, draw.y, draw.w, draw.h);
     }
 
     position += drawSize;
@@ -3212,7 +3750,7 @@ function drawTiledEdgeRuns(ctx, frame, runs, dest, axis, mirror) {
 function drawFixedRegion(ctx, frame, source, dest) {
   if (source.w <= 0 || source.h <= 0 || dest.w <= 0 || dest.h <= 0) return;
   ctx.drawImage(
-    state.keyedCanvas,
+    getRenderCanvas(),
     frame.x + source.x,
     frame.y + source.y,
     source.w,
@@ -3341,7 +3879,7 @@ function renderTwentyFivePatch(ctx, frame, patch, dw, dh, mode, variant = "full"
       const horizontalRail = (row === 0 || row === 4) && (col === 1 || col === 3);
       const verticalRail = (col === 0 || col === 4) && (row === 1 || row === 3);
       if (mode === "stretch" || (!horizontalRail && !verticalRail)) {
-        ctx.drawImage(state.keyedCanvas, src.x, src.y, src.w, src.h, dst.x, dst.y, dst.w, dst.h);
+        ctx.drawImage(getRenderCanvas(), src.x, src.y, src.w, src.h, dst.x, dst.y, dst.w, dst.h);
       } else {
         drawTiledRegion(ctx, src, dst, horizontalRail, verticalRail, mode === "mirror");
       }
@@ -3362,7 +3900,7 @@ function renderNinePatch(ctx, frame, patch, dw, dh) {
     for (let col = 0; col < 3; col += 1) {
       if (row === 1 && col === 1) continue;
       ctx.drawImage(
-        state.keyedCanvas,
+        getRenderCanvas(),
         frame.x + xs[col],
         frame.y + ys[row],
         sw[col],
@@ -3394,16 +3932,16 @@ function drawTiledRegion(ctx, src, dst, tileX, tileY, mirror) {
         ctx.save();
         ctx.translate(x + w, y);
         ctx.scale(-1, 1);
-        ctx.drawImage(state.keyedCanvas, src.x + src.w - sourceW, src.y, sourceW, sourceH, 0, 0, w, h);
+        ctx.drawImage(getRenderCanvas(), src.x + src.w - sourceW, src.y, sourceW, sourceH, 0, 0, w, h);
         ctx.restore();
       } else if (mirror && tileIndex % 2 === 1 && tileY) {
         ctx.save();
         ctx.translate(x, y + h);
         ctx.scale(1, -1);
-        ctx.drawImage(state.keyedCanvas, src.x, src.y + src.h - sourceH, sourceW, sourceH, 0, 0, w, h);
+        ctx.drawImage(getRenderCanvas(), src.x, src.y + src.h - sourceH, sourceW, sourceH, 0, 0, w, h);
         ctx.restore();
       } else {
-        ctx.drawImage(state.keyedCanvas, src.x, src.y, sourceW, sourceH, x, y, w, h);
+        ctx.drawImage(getRenderCanvas(), src.x, src.y, sourceW, sourceH, x, y, w, h);
       }
       tileIndex += 1;
     }
@@ -3419,6 +3957,208 @@ function resizeCanvasBitmap(canvas, width, height) {
 function setCanvasDisplayScale(canvas, width, height, scale) {
   canvas.style.width = `${Math.max(1, width * scale)}px`;
   canvas.style.height = `${Math.max(1, height * scale)}px`;
+}
+
+function setProcessingStatus(message) {
+  if (els.processStatus) els.processStatus.textContent = message || "";
+}
+
+function createCanvas(width, height) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(width));
+  canvas.height = Math.max(1, Math.round(height));
+  return canvas;
+}
+
+function cropCanvas(source, rect) {
+  const canvas = createCanvas(rect.w, rect.h);
+  canvas.getContext("2d").drawImage(source, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+  return canvas;
+}
+
+function frameSheetRect(frame, rect) {
+  return { x: frame.x + rect.x, y: frame.y + rect.y, w: rect.w, h: rect.h };
+}
+
+function offsetCanvas1d(source, axis, amount) {
+  const canvas = createCanvas(source.width, source.height);
+  const ctx = canvas.getContext("2d");
+  const span = axis === "x" ? source.width : source.height;
+  if (span <= 1) {
+    ctx.drawImage(source, 0, 0);
+    return canvas;
+  }
+  const offset = ((Math.round(amount) % span) + span) % span;
+  if (axis === "x") {
+    ctx.drawImage(source, offset, 0);
+    ctx.drawImage(source, offset - span, 0);
+  } else {
+    ctx.drawImage(source, 0, offset);
+    ctx.drawImage(source, 0, offset - span);
+  }
+  return canvas;
+}
+
+function createBandMask(width, height, axis, bands) {
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#fff";
+  for (const band of bands) {
+    const start = Math.round(band.start);
+    const end = Math.round(band.end);
+    if (end <= start) continue;
+    if (axis === "x") {
+      ctx.fillRect(start, 0, end - start, canvas.height);
+    } else {
+      ctx.fillRect(0, start, canvas.width, end - start);
+    }
+  }
+  return canvas;
+}
+
+function createInsideMask(width, height, axis, pixels) {
+  const span = axis === "x" ? width : height;
+  const px = clamp(Math.round(pixels), 0, Math.max(0, span));
+  if (px <= 0) return null;
+  const center = Math.floor(span / 2);
+  const start = clamp(center - px, 0, span - 1);
+  const end = clamp(center + px, start + 1, span);
+  return createBandMask(width, height, axis, [{ start, end }]);
+}
+
+function createOutsideMask(width, height, axis, sliceInBounds, pixels) {
+  const span = axis === "x" ? width : height;
+  const px = clamp(Math.round(pixels), 0, span);
+  if (px <= 0) return null;
+  const sliceStart = axis === "x" ? sliceInBounds.x : sliceInBounds.y;
+  const sliceEnd = axis === "x" ? sliceInBounds.x + sliceInBounds.w : sliceInBounds.y + sliceInBounds.h;
+  const bands = [
+    { start: Math.max(0, sliceStart - px), end: Math.max(0, sliceStart) },
+    { start: Math.min(span, sliceEnd), end: Math.min(span, sliceEnd + px) },
+  ].filter((band) => band.end > band.start);
+  return bands.length > 0 ? createBandMask(width, height, axis, bands) : null;
+}
+
+function loadCanvasFromDataUrl(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = createCanvas(img.naturalWidth, img.naturalHeight);
+      canvas.getContext("2d").drawImage(img, 0, 0);
+      resolve(canvas);
+    };
+    img.onerror = () => reject(new Error("Could not load processed image returned by GMIC."));
+    img.src = dataUrl;
+  });
+}
+
+async function runGmicInpaint(imageCanvas, maskCanvas, preset) {
+  const response = await fetch("/api/gmic/inpaint", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      image: imageCanvas.toDataURL("image/png"),
+      mask: maskCanvas.toDataURL("image/png"),
+      preset,
+    }),
+  });
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.error || "GMIC processing failed.");
+  }
+  return loadCanvasFromDataUrl(payload.image);
+}
+
+function selectedSliceProcessBounds(frame, side, rect, outsidePx) {
+  const axis = sideAxis(side);
+  const sheet = frameSheetRect(frame, rect);
+  if (axis === "x") {
+    const x = Math.max(0, sheet.x - outsidePx);
+    const x2 = Math.min(state.keyedCanvas.width, sheet.x + sheet.w + outsidePx);
+    return {
+      bounds: { x, y: sheet.y, w: Math.max(1, x2 - x), h: sheet.h },
+      slice: { x: sheet.x - x, y: 0, w: sheet.w, h: sheet.h },
+    };
+  }
+  const y = Math.max(0, sheet.y - outsidePx);
+  const y2 = Math.min(state.keyedCanvas.height, sheet.y + sheet.h + outsidePx);
+  return {
+    bounds: { x: sheet.x, y, w: sheet.w, h: Math.max(1, y2 - y) },
+    slice: { x: 0, y: sheet.y - y, w: sheet.w, h: sheet.h },
+  };
+}
+
+async function processSelectedSlice(preset) {
+  const selected = getSelectedSliceRun();
+  if (!selected || state.processingBusy) return;
+  const label = PROCESS_PRESETS[preset] || preset;
+  const insidePx = clamp(Number(els.processInsidePx?.value || 0), 0, 128);
+  const outsidePx = clamp(Number(els.processOutsidePx?.value || 0), 0, 128);
+  const axis = sideAxis(selected.side);
+  const offsetSpan = axis === "x" ? selected.rect.w : selected.rect.h;
+  const offset = Math.floor(offsetSpan / 2);
+
+  state.processingBusy = true;
+  renderProcessingPane();
+  setProcessingStatus(`${label}: preparing ${selected.name}...`);
+
+  try {
+    state.processedPatches.delete(selected.key);
+    rebuildProcessedCanvas(false);
+    const sourceCanvas = getRenderCanvas();
+    const sheetRect = frameSheetRect(selected.frame, selected.rect);
+    let seamlessSlice = cropCanvas(sourceCanvas, sheetRect);
+
+    const insideMask = createInsideMask(seamlessSlice.width, seamlessSlice.height, axis, insidePx);
+    if (insideMask && offset > 0) {
+      setProcessingStatus(`${label}: making slice seamless...`);
+      const offsetSlice = offsetCanvas1d(seamlessSlice, axis, offset);
+      const inpaintedOffset = await runGmicInpaint(offsetSlice, insideMask, preset);
+      seamlessSlice = offsetCanvas1d(inpaintedOffset, axis, -offset);
+    }
+
+    const { bounds, slice } = selectedSliceProcessBounds(selected.frame, selected.side, selected.rect, outsidePx);
+    let patchCanvas = cropCanvas(sourceCanvas, bounds);
+    patchCanvas.getContext("2d").drawImage(seamlessSlice, slice.x, slice.y);
+
+    const outsideMask = createOutsideMask(patchCanvas.width, patchCanvas.height, axis, slice, outsidePx);
+    if (outsideMask) {
+      setProcessingStatus(`${label}: blending outside pixels...`);
+      patchCanvas = await runGmicInpaint(patchCanvas, outsideMask, preset);
+    }
+
+    state.processedPatches.set(selected.key, {
+      frameId: selected.frame.id,
+      side: selected.side,
+      index: selected.index,
+      x: bounds.x,
+      y: bounds.y,
+      w: bounds.w,
+      h: bounds.h,
+      canvas: patchCanvas,
+      preset,
+      insidePx,
+      outsidePx,
+    });
+    rebuildProcessedCanvas(false);
+    setProcessingStatus(`${label}: applied to ${selected.name}.`);
+  } catch (error) {
+    rebuildProcessedCanvas(false);
+    const hint = location.protocol === "file:"
+      ? " Start the local server with python3 server.py and open the local URL."
+      : "";
+    setProcessingStatus(`${error.message}${hint}`);
+  } finally {
+    state.processingBusy = false;
+    renderAll();
+  }
 }
 
 function fittedCanvasRect(canvas) {
@@ -3476,7 +4216,10 @@ function addManualFrame(rect) {
   state.frames.sort((a, b) => (a.y - b.y) || (a.x - b.x));
   state.patches.set(id, suggestPatch(frame));
   state.edgeAreas.set(id, suggestEdgeAreas(frame));
+  state.frameSettings.set(id, getUiSettings());
   state.selectedId = id;
+  clearSelectedSlice(false);
+  scheduleSaveCurrentImageState();
 }
 
 function selectFrameAt(point) {
@@ -3488,7 +4231,9 @@ function selectFrameAt(point) {
   ));
   if (hits.length === 0) return;
   hits.sort((a, b) => (a.w * a.h) - (b.w * b.h));
+  if (state.selectedId !== hits[0].id) clearSelectedSlice(false);
   state.selectedId = hits[0].id;
+  scheduleSaveCurrentImageState();
   renderAll();
 }
 
@@ -3569,9 +4314,12 @@ function findAreaHit(point) {
   const areas = getSelectedAreas();
   if (!frame || !areas) return null;
   const handleThreshold = Math.max(5, Math.max(frame.w, frame.h) / 90);
+  const medallionHit = findEditableRunHit(point, areas.fixedRuns || {}, "medallion", handleThreshold);
+  if (medallionHit) return medallionHit;
   const sliceHit = findEditableRunHit(point, areas.tileRuns || {}, "slice", handleThreshold);
   if (sliceHit) return sliceHit;
   for (const side of EDGE_SIDES) {
+    if (sideHasTileRuns(areas, side)) continue;
     const rect = areas[side];
     for (const handle of getAreaHandlePoints(side, rect)) {
       if (Math.hypot(point.x - handle.x, point.y - handle.y) <= handleThreshold) {
@@ -3580,6 +4328,7 @@ function findAreaHit(point) {
     }
   }
   const candidates = EDGE_SIDES
+    .filter((side) => !sideHasTileRuns(areas, side))
     .map((side) => ({ side, rect: areas[side] }))
     .filter(({ rect }) => pointInExpandedRect(point, rect, 3));
   if (candidates.length === 0) return null;
@@ -3594,17 +4343,33 @@ function updateGuide(axis, name, value) {
   if (!frame || !patch) return;
   patch[axis][name] = value;
   constrainPatch(frame, patch);
+  rememberFrameSettings(frame);
+  scheduleSaveCurrentImageState();
   renderAll();
+}
+
+function refreshAutoMedallions(frame, areas) {
+  if (areas.fixedRunsExplicit === true) return;
+  const detected = detectMedallions(frame, areas);
+  for (const side of EDGE_SIDES) {
+    if (areas.fixedRunsExplicitSides?.[side] === true && areas.medallions?.[side]) {
+      detected[side] = areas.medallions[side];
+    }
+  }
+  areas.medallions = detected;
 }
 
 function updateArea(side, name, value) {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
   if (!frame || !areas || !areas[side]) return;
+  if (state.hasProcessedPatches) clearProcessedFrame(frame.id, false);
   areas[side][name] = value;
   areas[side] = fitAreaToAlpha(frame, side, areas[side], areas.center);
-  areas.medallions = detectMedallions(frame, areas);
+  refreshAutoMedallions(frame, areas);
   state.edgeAreas.set(frame.id, constrainEdgeAreas(frame, areas));
+  rememberFrameSettings(frame);
+  scheduleSaveCurrentImageState();
   renderAll();
 }
 
@@ -3612,14 +4377,17 @@ function moveArea(side, dx, dy, sourceRect) {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
   if (!frame || !areas || !areas[side]) return;
+  if (state.hasProcessedPatches) clearProcessedFrame(frame.id, false);
   areas[side] = normalizeRect(frame, {
     ...sourceRect,
     x: sourceRect.x + dx,
     y: sourceRect.y + dy,
   }, 1);
   areas[side] = fitAreaToAlpha(frame, side, areas[side], areas.center);
-  areas.medallions = detectMedallions(frame, areas);
+  refreshAutoMedallions(frame, areas);
   state.edgeAreas.set(frame.id, constrainEdgeAreas(frame, areas));
+  rememberFrameSettings(frame);
+  scheduleSaveCurrentImageState();
   renderAll();
 }
 
@@ -3627,6 +4395,7 @@ function resizeArea(side, handle, point, sourceRect) {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
   if (!frame || !areas || !areas[side]) return;
+  if (state.hasProcessedPatches) clearProcessedFrame(frame.id, false);
   let next = cloneRect(sourceRect);
   if (side === "top" || side === "bottom") {
     if (handle === "start") {
@@ -3646,8 +4415,10 @@ function resizeArea(side, handle, point, sourceRect) {
     next.h = end - sourceRect.y;
   }
   areas[side] = fitAreaToAlpha(frame, side, next, areas.center);
-  areas.medallions = detectMedallions(frame, areas);
+  refreshAutoMedallions(frame, areas);
   state.edgeAreas.set(frame.id, constrainEdgeAreas(frame, areas));
+  rememberFrameSettings(frame);
+  scheduleSaveCurrentImageState();
   renderAll();
 }
 
@@ -3682,7 +4453,10 @@ function defaultEditableRunRect(areas, side, point) {
 }
 
 function setConstrainedAreas(frame, areas) {
+  if (state.hasProcessedPatches) clearProcessedFrame(frame.id, false);
   state.edgeAreas.set(frame.id, constrainEdgeAreas(frame, areas));
+  rememberFrameSettings(frame);
+  scheduleSaveCurrentImageState();
   renderAll();
 }
 
@@ -3693,10 +4467,83 @@ function cleanRunCollection(collection, side) {
   return collection;
 }
 
+function setRunCollectionSide(areas, key, side, runs) {
+  if (runs.length > 0) {
+    areas[key] ||= {};
+    areas[key][side] = runs.map(cloneRect);
+    return;
+  }
+  if (!areas[key]) return;
+  delete areas[key][side];
+  if (Object.keys(areas[key]).length === 0) delete areas[key];
+}
+
+function setMedallionForSide(areas, side, fixedRuns) {
+  const medallion = representativeFixedMedallions({ [side]: fixedRuns }, areas)[side];
+  if (medallion) {
+    areas.medallions ||= {};
+    areas.medallions[side] = cloneRect(medallion);
+    return;
+  }
+  if (!areas.medallions) return;
+  delete areas.medallions[side];
+  if (Object.keys(areas.medallions).length === 0) delete areas.medallions;
+}
+
+function setExplicitFixedSide(areas, side, explicit) {
+  if (explicit) {
+    areas.fixedRunsExplicitSides ||= {};
+    areas.fixedRunsExplicitSides[side] = true;
+    return;
+  }
+  if (!areas.fixedRunsExplicitSides) return;
+  delete areas.fixedRunsExplicitSides[side];
+  if (Object.keys(areas.fixedRunsExplicitSides).length === 0) delete areas.fixedRunsExplicitSides;
+}
+
+function scanRepeatSide(side) {
+  const frame = getSelectedFrame();
+  const areas = getSelectedAreas();
+  if (!frame || !areas || !EDGE_SIDES.includes(side)) return;
+
+  const next = cloneAreas(areas);
+  const center = normalizeRect(frame, next.center || findTransparentCenterRect(frame), 1);
+  const scan = buildSideRepeatScan(frame, center, side);
+  const scans = state.repeatScans.get(frame.id) || {};
+  scans[side] = scan;
+  state.repeatScans.set(frame.id, scans);
+
+  if (!scan.period || scan.repeatableRuns.length < 2) {
+    setStatus(`${frame.name}: no repeat found on ${side}.`);
+    return;
+  }
+
+  next.center = center;
+  next[side] = sideAreaFromRepeatScan(frame, center, side, scan);
+  const tileRuns = repeatScanTileRunsForSide(next[side], scan, side);
+  if (tileRuns.length === 0) {
+    setStatus(`${frame.name}: repeat scan found no usable ${side} slices.`);
+    return;
+  }
+
+  const fixedRuns = repeatScanFixedRunsForSide(next[side], scan, tileRuns, side);
+  setRunCollectionSide(next, "tileRuns", side, tileRuns);
+  setRunCollectionSide(next, "fixedRuns", side, fixedRuns);
+  setExplicitFixedSide(next, side, fixedRuns.length > 0);
+  setMedallionForSide(next, side, fixedRuns);
+
+  state.edgeAreas.set(frame.id, constrainEdgeAreas(frame, next));
+  rememberFrameSettings(frame);
+  scheduleSaveCurrentImageState();
+  renderAll();
+  setStatus(`${frame.name}: ${side} repeat scan applied, period ${scan.period}px.`);
+}
+
 function addSliceAt(side, point) {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
   if (!frame || !areas || !areas[side]) return;
+  clearProcessedFrame(frame.id, false);
   const rect = defaultEditableRunRect(areas, side, point);
   areas.tileRuns ||= {};
   areas.tileRuns[side] ||= [];
@@ -3708,6 +4555,7 @@ function setSliceRun(side, index, rect) {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
   if (!frame || !areas || !areas[side] || !areas.tileRuns?.[side]?.[index]) return;
+  clearProcessedSlice(frame.id, side, index, false);
   const runs = areas.tileRuns[side].map(cloneRect);
   runs[index] = clampRectInside(rect, areas[side]);
   areas.tileRuns[side] = runs;
@@ -3718,8 +4566,48 @@ function deleteSliceRun(side, index) {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
   if (!frame || !areas || !areas.tileRuns?.[side]?.[index]) return;
+  clearProcessedFrame(frame.id, false);
+  if (state.selectedSlice?.kind === "slice" && state.selectedSlice?.frameId === frame.id && state.selectedSlice.side === side && state.selectedSlice.index === index) {
+    clearSelectedSlice(false);
+  }
   areas.tileRuns[side].splice(index, 1);
   areas.tileRuns = cleanRunCollection(areas.tileRuns, side);
+  setConstrainedAreas(frame, areas);
+}
+
+function addMedallionAt(side, point) {
+  const frame = getSelectedFrame();
+  const areas = getSelectedAreas();
+  if (!frame || !areas || !areas[side]) return;
+  const rect = defaultEditableRunRect(areas, side, point);
+  areas.fixedRuns ||= {};
+  areas.fixedRuns[side] ||= [];
+  areas.fixedRuns[side].push(rect);
+  areas.fixedRunsExplicit = true;
+  delete areas.medallions;
+  setConstrainedAreas(frame, areas);
+}
+
+function setMedallionRun(side, index, rect) {
+  const frame = getSelectedFrame();
+  const areas = getSelectedAreas();
+  if (!frame || !areas || !areas[side] || !areas.fixedRuns?.[side]?.[index]) return;
+  const runs = areas.fixedRuns[side].map(cloneRect);
+  runs[index] = clampRectInside(rect, areas[side]);
+  areas.fixedRuns[side] = runs;
+  areas.fixedRunsExplicit = true;
+  delete areas.medallions;
+  setConstrainedAreas(frame, areas);
+}
+
+function deleteMedallionRun(side, index) {
+  const frame = getSelectedFrame();
+  const areas = getSelectedAreas();
+  if (!frame || !areas || !areas.fixedRuns?.[side]?.[index]) return;
+  areas.fixedRuns[side].splice(index, 1);
+  areas.fixedRuns = cleanRunCollection(areas.fixedRuns, side);
+  areas.fixedRunsExplicit = true;
+  delete areas.medallions;
   setConstrainedAreas(frame, areas);
 }
 
@@ -3734,6 +4622,8 @@ function moveEditableRun(drag, point) {
   }, areas[drag.side]);
   if (drag.kind === "slice") {
     setSliceRun(drag.side, drag.index, next);
+  } else if (drag.kind === "medallion") {
+    setMedallionRun(drag.side, drag.index, next);
   }
 }
 
@@ -3766,6 +4656,8 @@ function resizeEditableRun(drag, point) {
   const next = resizePrimaryRunRect(drag.side, drag.handle, point, drag.rect, areas[drag.side]);
   if (drag.kind === "slice") {
     setSliceRun(drag.side, drag.index, next);
+  } else if (drag.kind === "medallion") {
+    setMedallionRun(drag.side, drag.index, next);
   }
 }
 
@@ -3780,6 +4672,18 @@ function expandSelectedAxis(axis) {
   }
   constrainPatch(frame, patch);
   renderAll();
+}
+
+function getFrameExportSettings(frame) {
+  const current = getUiSettings();
+  const saved = state.frameSettings.get(frame.id);
+  if (!saved) return current;
+  return {
+    colors: current.colors,
+    detection: current.detection,
+    areas: saved.areas || current.areas,
+    previewMode: current.previewMode,
+  };
 }
 
 function serializePatch(frame) {
@@ -3827,6 +4731,7 @@ function serializePatch(frame) {
       threshold: Number(els.alphaThreshold.value),
       source: "png-alpha",
     },
+    settings: getFrameExportSettings(frame),
     legacyGrid: {
       columns: [0, patch.v.left, patch.v.centerStart, patch.v.centerEnd, patch.v.right, frame.w],
       rows: [0, patch.h.top, patch.h.centerStart, patch.h.centerEnd, patch.h.bottom, frame.h],
@@ -3852,6 +4757,24 @@ function serializeEdgeSide(areas, side, axis, mode) {
   return data;
 }
 
+function fileSlug(value, fallback = "export") {
+  const slug = String(value || fallback)
+    .replace(/\.[^.]+$/, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return slug || fallback;
+}
+
+function imageFileBase() {
+  return fileSlug(state.imageName, "image");
+}
+
+function frameFileBase(frame) {
+  return fileSlug(frame.name, "frame");
+}
+
 function downloadBlob(name, blob) {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -3864,44 +4787,65 @@ function downloadBlob(name, blob) {
   }, 0);
 }
 
-function downloadCurrentCrop() {
-  const frame = getSelectedFrame();
+function downloadFrameCrop(frame, prefix = "") {
   if (!frame) return;
   const canvas = document.createElement("canvas");
   canvas.width = frame.w;
   canvas.height = frame.h;
-  canvas.getContext("2d").drawImage(state.keyedCanvas, frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
+  canvas.getContext("2d").drawImage(getRenderCanvas(), frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
   canvas.toBlob((blob) => {
-    if (blob) downloadBlob(`${frame.name.toLowerCase().replace(/\s+/g, "_")}.png`, blob);
+    if (blob) downloadBlob(`${prefix}${frameFileBase(frame)}.png`, blob);
   }, "image/png");
 }
 
+function downloadCurrentCrop() {
+  downloadFrameCrop(getSelectedFrame());
+}
+
+function downloadAllCrops() {
+  const prefix = `${imageFileBase()}.`;
+  state.frames.forEach((frame) => downloadFrameCrop(frame, prefix));
+}
+
 function downloadTransparentSheet() {
-  if (!state.keyedCanvas.width || !state.keyedCanvas.height) return;
-  state.keyedCanvas.toBlob((blob) => {
-    if (blob) downloadBlob(`${state.imageName.replace(/\.[^.]+$/, "")}.processed.png`, blob);
+  const canvas = getRenderCanvas();
+  if (!canvas.width || !canvas.height) return;
+  canvas.toBlob((blob) => {
+    if (blob) downloadBlob(`${imageFileBase()}.processed.png`, blob);
   }, "image/png");
 }
 
 function downloadCurrentJson() {
   const frame = getSelectedFrame();
   if (!frame) return;
+  rememberFrameSettings(frame);
+  flushPendingSave();
   downloadBlob(
-    `${frame.name.toLowerCase().replace(/\s+/g, "_")}.patch.json`,
+    `${frameFileBase(frame)}.patch.json`,
     new Blob([JSON.stringify(serializePatch(frame), null, 2)], { type: "application/json" }),
   );
 }
 
 function downloadAllJson() {
+  flushPendingSave();
   const payload = {
     image: state.imageName,
     generatedBy: "Frame Patch Lab",
+    settings: getUiSettings(),
     frames: state.frames.map((frame) => serializePatch(frame)),
   };
   downloadBlob(
-    `${state.imageName.replace(/\.[^.]+$/, "")}.patches.json`,
+    `${imageFileBase()}.patches.json`,
     new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
   );
+}
+
+function downloadAll() {
+  flushPendingSave();
+  downloadTransparentSheet();
+  downloadAllCrops();
+  downloadAllJson();
+  setStatus(`Exporting sheet, ${state.frames.length} crop${state.frames.length === 1 ? "" : "s"}, and JSON.`);
 }
 
 function updateSliceScanControls() {
@@ -3921,8 +4865,9 @@ function editorMenuContext(point) {
   if (!frame || !areas) return { point, side: null, sliceHit: null, medallionHit: null };
   const handleThreshold = Math.max(5, Math.max(frame.w, frame.h) / 90);
   const sliceHit = findEditableRunHit(point, areas.tileRuns || {}, "slice", handleThreshold);
-  const side = sliceHit?.side || findAreaSideAtPoint(point, areas);
-  return { point, side, sliceHit, medallionHit: null };
+  const medallionHit = findEditableRunHit(point, areas.fixedRuns || {}, "medallion", handleThreshold);
+  const side = medallionHit?.side || sliceHit?.side || findAreaSideAtPoint(point, areas);
+  return { point, side, sliceHit, medallionHit };
 }
 
 function hideEditorContextMenu() {
@@ -3957,11 +4902,17 @@ function showEditorContextMenu(event) {
   const sliceLabel = context.sliceHit
     ? `Delete ${context.sliceHit.side} slice ${context.sliceHit.index + 1}`
     : "Delete Slice";
+  const medallionLabel = context.medallionHit
+    ? `Delete ${context.medallionHit.side} medallion ${context.medallionHit.index + 1}`
+    : "Delete Medallion";
   const sideLabel = context.side ? `${context.side} ` : "";
   const menu = els.editorContextMenu;
   menu.innerHTML = "";
+  addContextMenuButton(menu, `Scan ${sideLabel}repeats`, Boolean(context.side), () => scanRepeatSide(context.side));
   addContextMenuButton(menu, `Add ${sideLabel}slice`, Boolean(context.side), () => addSliceAt(context.side, context.point));
+  addContextMenuButton(menu, `Add ${sideLabel}medallion`, Boolean(context.side), () => addMedallionAt(context.side, context.point));
   addContextMenuButton(menu, sliceLabel, Boolean(context.sliceHit), () => deleteSliceRun(context.sliceHit.side, context.sliceHit.index));
+  addContextMenuButton(menu, medallionLabel, Boolean(context.medallionHit), () => deleteMedallionRun(context.medallionHit.side, context.medallionHit.index));
 
   menu.hidden = false;
   const margin = 6;
@@ -3985,24 +4936,40 @@ function installEvents() {
     els.mainColor.value = rgbToHex(roleColors.main);
     els.secondaryColor.value = rgbToHex(roleColors.secondary);
     processImage();
+    rememberFrameSettings();
+    scheduleSaveCurrentImageState();
   });
   els.mainColor.addEventListener("input", () => {
     if (Number(els.mainTint.value) === 0) els.mainTint.value = 100;
     processImage();
+    rememberFrameSettings();
+    scheduleSaveCurrentImageState();
   });
   els.secondaryColor.addEventListener("input", () => {
     if (Number(els.secondaryTint.value) === 0) els.secondaryTint.value = 100;
     processImage();
+    rememberFrameSettings();
+    scheduleSaveCurrentImageState();
   });
   [els.mainTint, els.mainDesaturate, els.secondaryTint, els.secondaryDesaturate].forEach((input) => {
-    input.addEventListener("input", processImage);
+    input.addEventListener("input", () => {
+      processImage();
+      rememberFrameSettings();
+      scheduleSaveCurrentImageState();
+    });
   });
   [els.alphaThreshold, els.mergeGap, els.framePadding, els.minArea].forEach((input) => {
-    input.addEventListener("input", updateControlLabels);
+    input.addEventListener("input", () => {
+      updateControlLabels();
+      rememberFrameSettings();
+      scheduleSaveCurrentImageState();
+    });
   });
   [els.sliceThreshold, els.sliceBridgeGap, els.sliceCornerGuard, els.sliceLengthLimit].forEach((input) => {
     input?.addEventListener("input", () => {
       updateSliceScanControls();
+      rememberFrameSettings();
+      scheduleSaveCurrentImageState();
     });
   });
   els.detectBtn.addEventListener("click", detectFrames);
@@ -4017,6 +4984,8 @@ function installEvents() {
     const patch = suggestPatch(frame, state.autoMode);
     if (patch) state.patches.set(frame.id, patch);
     state.edgeAreas.set(frame.id, suggestEdgeAreas(frame, state.autoMode));
+    rememberFrameSettings(frame);
+    scheduleSaveCurrentImageState();
     renderAll();
   });
   document.querySelectorAll("[data-area]").forEach((input) => {
@@ -4029,19 +4998,39 @@ function installEvents() {
     button.addEventListener("click", () => {
       state.previewMode = button.dataset.previewMode;
       document.querySelectorAll("[data-preview-mode]").forEach((b) => b.classList.toggle("active", b === button));
+      rememberFrameSettings();
+      scheduleSaveCurrentImageState();
       renderPreviews();
     });
   });
   document.querySelectorAll("[data-auto-mode]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.autoMode = button.dataset.autoMode;
+      state.autoMode = normalizeAutoMode(button.dataset.autoMode);
       document.querySelectorAll("[data-auto-mode]").forEach((b) => b.classList.toggle("active", b === button));
+      rememberFrameSettings();
+      scheduleSaveCurrentImageState();
     });
   });
+  els.downloadAllBtn.addEventListener("click", downloadAll);
   els.downloadCropBtn.addEventListener("click", downloadCurrentCrop);
   els.downloadSheetBtn.addEventListener("click", downloadTransparentSheet);
   els.downloadJsonBtn.addEventListener("click", downloadCurrentJson);
   els.downloadAllJsonBtn.addEventListener("click", downloadAllJson);
+  document.querySelectorAll("[data-process-preset]").forEach((button) => {
+    button.addEventListener("click", () => processSelectedSlice(button.dataset.processPreset));
+  });
+  els.resetSliceProcessBtn?.addEventListener("click", () => {
+    const selected = getSelectedSliceRun();
+    if (!selected) return;
+    clearProcessedSlice(selected.frame.id, selected.side, selected.index);
+    setProcessingStatus(`Reset ${selected.name}.`);
+  });
+  els.resetFrameProcessBtn?.addEventListener("click", () => {
+    const frame = getSelectedFrame();
+    if (!frame) return;
+    clearProcessedFrame(frame.id);
+    setProcessingStatus(`Reset processed slices for ${frame.name}.`);
+  });
 
   els.sourceCanvas.addEventListener("pointerdown", (event) => {
     event.preventDefault();
@@ -4068,6 +5057,7 @@ function installEvents() {
     state.sourceDrag = null;
     addManualFrame(rect);
     renderAll();
+    flushPendingSave();
   });
 
   els.editorCanvas.addEventListener("pointerdown", (event) => {
@@ -4077,7 +5067,17 @@ function installEvents() {
     const point = canvasPoint(event, els.editorCanvas);
     if (!point.inside) return;
     const hit = findAreaHit(point);
-    if (!hit) return;
+    if (!hit) {
+      clearSelectedSlice();
+      return;
+    }
+    if (hit.kind === "slice") {
+      selectSliceHit(hit);
+    } else if (hit.kind === "area") {
+      selectAreaSliceHit(hit);
+    } else {
+      clearSelectedSlice();
+    }
     state.areaDrag = hit;
     els.editorCanvas.setPointerCapture(event.pointerId);
   });
@@ -4106,9 +5106,11 @@ function installEvents() {
     if (!state.areaDrag) return;
     event.preventDefault();
     state.areaDrag = null;
+    flushPendingSave();
   });
   els.editorCanvas.addEventListener("pointercancel", () => {
     state.areaDrag = null;
+    flushPendingSave();
   });
   els.editorCanvas.addEventListener("contextmenu", showEditorContextMenu);
   document.addEventListener("pointerdown", (event) => {
@@ -4119,6 +5121,7 @@ function installEvents() {
     if (event.key === "Escape") hideEditorContextMenu();
   });
   window.addEventListener("resize", hideEditorContextMenu);
+  window.addEventListener("beforeunload", flushPendingSave);
 }
 
 initImageOptions();

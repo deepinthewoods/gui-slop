@@ -116,7 +116,6 @@
                   <button data-auto-mode="cornerSafeExpanded" type="button">Safe Expanded</button>
                   <button data-auto-mode="projection" type="button">Projection</button>
                   <button data-auto-mode="sliceScan" type="button">Slice Scan</button>
-                  <button data-auto-mode="repeatScan" type="button">Repeat Scan</button>
                 </div>
                 <button id="autoGuidesBtn" type="button">Auto Areas</button>
               </div>
@@ -164,17 +163,49 @@
             </div>
           </section>
 
-          <section class="panel">
+          <section class="panel export-process-panel">
             <div class="panel-heading">
               <h2>Export</h2>
             </div>
             <div class="export-actions">
+              <button id="downloadAllBtn" type="button">Export All</button>
               <button id="downloadSheetBtn" type="button">PNG Sheet</button>
               <button id="downloadCropBtn" type="button">PNG Crop</button>
               <button id="downloadJsonBtn" type="button">Patch JSON</button>
               <button id="downloadAllJsonBtn" type="button">All JSON</button>
             </div>
             <div id="selectionStats" class="stats"></div>
+
+            <div class="processing-pane">
+              <div class="panel-heading compact-heading">
+                <h2>Processing</h2>
+              </div>
+              <div id="processSliceReadout" class="stats process-readout">Select a slice in Areas.</div>
+              <div class="processing-fields">
+                <label class="field">
+                  <span>Inside px</span>
+                  <input id="processInsidePx" type="number" min="0" max="128" step="1" value="6">
+                </label>
+                <label class="field">
+                  <span>Outside px</span>
+                  <input id="processOutsidePx" type="number" min="0" max="128" step="1" value="6">
+                </label>
+              </div>
+              <div class="process-actions" aria-label="Inpaint presets">
+                <button data-process-preset="fastAverage" type="button">Fast Avg</button>
+                <button data-process-preset="fastMedian" type="button">Fast Median</button>
+                <button data-process-preset="patchSmall" type="button">Patch Small</button>
+                <button data-process-preset="patchStrong" type="button">Patch Strong</button>
+                <button data-process-preset="matchPatch" type="button">MatchPatch</button>
+                <button data-process-preset="pdeSmooth" type="button">PDE Smooth</button>
+                <button data-process-preset="morphological" type="button">Morpho</button>
+              </div>
+              <div class="process-reset-actions">
+                <button id="resetSliceProcessBtn" type="button">Reset Slice</button>
+                <button id="resetFrameProcessBtn" type="button">Reset Frame</button>
+              </div>
+              <div id="processStatus" class="stats"></div>
+            </div>
           </section>
         </section>
 
