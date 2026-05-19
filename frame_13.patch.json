@@ -1,0 +1,85 @@
+{
+  "name": "Frame 13",
+  "image": "test.png",
+  "sourceRect": [
+    430,
+    892,
+    170,
+    201
+  ],
+  "grid": {
+    "columns": [
+      0,
+      54,
+      56,
+      112,
+      114,
+      170
+    ],
+    "rows": [
+      0,
+      78,
+      110,
+      111,
+      136,
+      201
+    ]
+  },
+  "fixed": {
+    "columns": [
+      0,
+      2,
+      4
+    ],
+    "rows": [
+      0,
+      2,
+      4
+    ]
+  },
+  "rails": {
+    "preferredMode": "tile",
+    "horizontalCells": [
+      [
+        1,
+        0
+      ],
+      [
+        3,
+        0
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        3,
+        4
+      ]
+    ],
+    "verticalCells": [
+      [
+        0,
+        1
+      ],
+      [
+        0,
+        3
+      ],
+      [
+        4,
+        1
+      ],
+      [
+        4,
+        3
+      ]
+    ]
+  },
+  "key": {
+    "color": "#e404dd",
+    "hardTolerance": 96,
+    "featherTolerance": 128,
+    "defringe": 1
+  }
+}

@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Frame Patch Lab</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <h1>Frame Patch Lab</h1>
+        <p id="statusText">Loading image...</p>
+      </div>
+      <div class="header-controls">
+        <label class="field inline">
+          <span>Image</span>
+          <select id="imageSelect"></select>
+        </label>
+        <label class="file-button">
+          Load PNG
+          <input id="fileInput" type="file" accept="image/png,image/*">
+        </label>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>Colours</h2>
+            <button id="autoColorsBtn" type="button">Auto</button>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Main colour</span>
+              <input id="mainColor" type="color" value="#68b85f">
+            </label>
+            <label class="field">
+              <span>Main recolour <output id="mainTintOut">0%</output></span>
+              <input id="mainTint" type="range" min="0" max="100" value="0">
+            </label>
+            <label class="field">
+              <span>Main desaturate <output id="mainDesaturateOut">0%</output></span>
+              <input id="mainDesaturate" type="range" min="0" max="100" value="0">
+            </label>
+            <label class="field">
+              <span>Secondary colour</span>
+              <input id="secondaryColor" type="color" value="#c95b5b">
+            </label>
+            <label class="field">
+              <span>Secondary recolour <output id="secondaryTintOut">0%</output></span>
+              <input id="secondaryTint" type="range" min="0" max="100" value="0">
+            </label>
+            <label class="field">
+              <span>Secondary desaturate <output id="secondaryDesaturateOut">0%</output></span>
+              <input id="secondaryDesaturate" type="range" min="0" max="100" value="0">
+            </label>
+          </div>
+          <div class="stats" id="colorStats"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>Frames</h2>
+            <button id="detectBtn" type="button">Detect</button>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>Alpha threshold <output id="alphaOut">30</output></span>
+              <input id="alphaThreshold" type="range" min="1" max="220" value="30">
+            </label>
+            <label class="field">
+              <span>Merge gap <output id="mergeOut">2</output></span>
+              <input id="mergeGap" type="range" min="0" max="32" value="2">
+            </label>
+            <label class="field">
+              <span>Padding <output id="padOut">2</output></span>
+              <input id="framePadding" type="range" min="0" max="16" value="2">
+            </label>
+            <label class="field">
+              <span>Min pixels</span>
+              <input id="minArea" type="number" min="1" step="100" value="700">
+            </label>
+          </div>
+          <button id="manualFrameBtn" class="full-button" type="button">Manual Box</button>
+          <div id="frameList" class="frame-list"></div>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <section class="panel sheet-panel">
+          <div class="panel-heading">
+            <h2>Sheet</h2>
+            <label class="field inline compact">
+              <span>View</span>
+              <select id="sourceView">
+                <option value="keyed">Processed</option>
+                <option value="original">Original</option>
+                <option value="mask">Mask</option>
+              </select>
+            </label>
+          </div>
+          <canvas id="sourceCanvas"></canvas>
+        </section>
+
+        <section class="two-column">
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Areas</h2>
+              <div class="patch-actions">
+                <div class="mode-tabs" role="tablist" aria-label="Auto area mode">
+                  <button class="active" data-auto-mode="stable" type="button">Stable</button>
+                  <button data-auto-mode="compact" type="button">Compact</button>
+                  <button data-auto-mode="cornerSafe" type="button">Corner Safe</button>
+                  <button data-auto-mode="cornerSafeExpanded" type="button">Safe Expanded</button>
+                  <button data-auto-mode="projection" type="button">Projection</button>
+                  <button data-auto-mode="sliceScan" type="button">Slice Scan</button>
+                  <button data-auto-mode="repeatScan" type="button">Repeat Scan</button>
+                </div>
+                <button id="autoGuidesBtn" type="button">Auto Areas</button>
+              </div>
+            </div>
+            <div class="field-grid">
+              <label class="field">
+                <span>Slice diff limit <output id="sliceThresholdOut">70%</output></span>
+                <input id="sliceThreshold" type="range" min="5" max="160" value="70">
+              </label>
+              <label class="field">
+                <span>Max bridge gap <output id="sliceBridgeOut">20%</output></span>
+                <input id="sliceBridgeGap" type="range" min="0" max="80" value="20">
+              </label>
+              <label class="field">
+                <span>Corner guard <output id="sliceCornerOut">12%</output></span>
+                <input id="sliceCornerGuard" type="range" min="0" max="40" value="12">
+              </label>
+              <label class="field">
+                <span>Slice length limit <output id="sliceLengthOut">2 px</output></span>
+                <input id="sliceLengthLimit" type="range" min="0" max="20" value="2">
+              </label>
+            </div>
+            <div class="editor-canvas-wrap">
+              <canvas id="editorCanvas"></canvas>
+              <div id="editorContextMenu" class="context-menu" hidden></div>
+            </div>
+            <div id="areaStats" class="stats"></div>
+            <div class="area-grid">
+              <label class="field"><span>Top X</span><input data-area="top.x" type="number" min="0" step="1"></label>
+              <label class="field"><span>Top Y</span><input data-area="top.y" type="number" min="0" step="1"></label>
+              <label class="field"><span>Top W</span><input data-area="top.w" type="number" min="1" step="1"></label>
+              <label class="field"><span>Top H</span><input data-area="top.h" type="number" min="1" step="1"></label>
+              <label class="field"><span>Bottom X</span><input data-area="bottom.x" type="number" min="0" step="1"></label>
+              <label class="field"><span>Bottom Y</span><input data-area="bottom.y" type="number" min="0" step="1"></label>
+              <label class="field"><span>Bottom W</span><input data-area="bottom.w" type="number" min="1" step="1"></label>
+              <label class="field"><span>Bottom H</span><input data-area="bottom.h" type="number" min="1" step="1"></label>
+              <label class="field"><span>Left X</span><input data-area="left.x" type="number" min="0" step="1"></label>
+              <label class="field"><span>Left Y</span><input data-area="left.y" type="number" min="0" step="1"></label>
+              <label class="field"><span>Left W</span><input data-area="left.w" type="number" min="1" step="1"></label>
+              <label class="field"><span>Left H</span><input data-area="left.h" type="number" min="1" step="1"></label>
+              <label class="field"><span>Right X</span><input data-area="right.x" type="number" min="0" step="1"></label>
+              <label class="field"><span>Right Y</span><input data-area="right.y" type="number" min="0" step="1"></label>
+              <label class="field"><span>Right W</span><input data-area="right.w" type="number" min="1" step="1"></label>
+              <label class="field"><span>Right H</span><input data-area="right.h" type="number" min="1" step="1"></label>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Export</h2>
+            </div>
+            <div class="export-actions">
+              <button id="downloadSheetBtn" type="button">PNG Sheet</button>
+              <button id="downloadCropBtn" type="button">PNG Crop</button>
+              <button id="downloadJsonBtn" type="button">Patch JSON</button>
+              <button id="downloadAllJsonBtn" type="button">All JSON</button>
+            </div>
+            <div id="selectionStats" class="stats"></div>
+          </section>
+        </section>
+
+        <section class="panel preview-panel">
+          <div class="panel-heading">
+            <h2>Previews</h2>
+            <div class="mode-tabs" role="tablist" aria-label="Render mode">
+              <button data-preview-mode="tile" type="button">Tile</button>
+              <button class="active" data-preview-mode="stretch" type="button">Stretch</button>
+              <button data-preview-mode="mirror" type="button">Mirror</button>
+            </div>
+          </div>
+          <div id="previewGrid" class="preview-grid"></div>
+        </section>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

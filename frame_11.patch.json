@@ -1,0 +1,85 @@
+{
+  "name": "Frame 11",
+  "image": "test.png",
+  "sourceRect": [
+    634,
+    886,
+    172,
+    207
+  ],
+  "grid": {
+    "columns": [
+      0,
+      42,
+      51,
+      118,
+      129,
+      172
+    ],
+    "rows": [
+      0,
+      70,
+      114,
+      116,
+      161,
+      207
+    ]
+  },
+  "fixed": {
+    "columns": [
+      0,
+      2,
+      4
+    ],
+    "rows": [
+      0,
+      2,
+      4
+    ]
+  },
+  "rails": {
+    "preferredMode": "tile",
+    "horizontalCells": [
+      [
+        1,
+        0
+      ],
+      [
+        3,
+        0
+      ],
+      [
+        1,
+        4
+      ],
+      [
+        3,
+        4
+      ]
+    ],
+    "verticalCells": [
+      [
+        0,
+        1
+      ],
+      [
+        0,
+        3
+      ],
+      [
+        4,
+        1
+      ],
+      [
+        4,
+        3
+      ]
+    ]
+  },
+  "key": {
+    "color": "#e404dd",
+    "hardTolerance": 96,
+    "featherTolerance": 128,
+    "defringe": 0.8
+  }
+}
