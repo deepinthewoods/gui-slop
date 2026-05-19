@@ -18,8 +18,8 @@
           <select id="imageSelect"></select>
         </label>
         <label class="file-button">
-          Load PNG
-          <input id="fileInput" type="file" accept="image/png,image/*">
+          Load Images
+          <input id="fileInput" type="file" accept="image/png,image/*" multiple>
         </label>
       </div>
     </header>
@@ -109,18 +109,16 @@
             <div class="panel-heading">
               <h2>Areas</h2>
               <div class="patch-actions">
-                <div class="mode-tabs" role="tablist" aria-label="Auto area mode">
-                  <button class="active" data-auto-mode="stable" type="button">Stable</button>
-                  <button data-auto-mode="compact" type="button">Compact</button>
-                  <button data-auto-mode="cornerSafe" type="button">Corner Safe</button>
-                  <button data-auto-mode="cornerSafeExpanded" type="button">Safe Expanded</button>
-                  <button data-auto-mode="projection" type="button">Projection</button>
-                  <button data-auto-mode="sliceScan" type="button">Slice Scan</button>
-                </div>
-                <button id="autoGuidesBtn" type="button">Auto Areas</button>
+                <button id="autoGuidesBtn" type="button">Slice Scan</button>
               </div>
             </div>
             <div class="field-grid">
+              <div class="auto-side-options" role="group" aria-label="Auto sides">
+                <label class="check-field"><input data-auto-side="top" type="checkbox" checked><span>Top</span></label>
+                <label class="check-field"><input data-auto-side="bottom" type="checkbox" checked><span>Bottom</span></label>
+                <label class="check-field"><input data-auto-side="left" type="checkbox" checked><span>Left</span></label>
+                <label class="check-field"><input data-auto-side="right" type="checkbox" checked><span>Right</span></label>
+              </div>
               <label class="field">
                 <span>Slice diff limit <output id="sliceThresholdOut">70%</output></span>
                 <input id="sliceThreshold" type="range" min="5" max="160" value="70">
@@ -134,7 +132,7 @@
                 <input id="sliceCornerGuard" type="range" min="0" max="40" value="12">
               </label>
               <label class="field">
-                <span>Slice length limit <output id="sliceLengthOut">2 px</output></span>
+                <span>Thickness tolerance <output id="sliceLengthOut">2 px</output></span>
                 <input id="sliceLengthLimit" type="range" min="0" max="20" value="2">
               </label>
             </div>
@@ -184,11 +182,11 @@
               <div class="processing-fields">
                 <label class="field">
                   <span>Inside px</span>
-                  <input id="processInsidePx" type="number" min="0" max="128" step="1" value="6">
+                  <input id="processInsidePx" type="number" min="0" max="128" step="1" value="3">
                 </label>
                 <label class="field">
                   <span>Outside px</span>
-                  <input id="processOutsidePx" type="number" min="0" max="128" step="1" value="6">
+                  <input id="processOutsidePx" type="number" min="0" max="128" step="1" value="1">
                 </label>
               </div>
               <div class="process-actions" aria-label="Inpaint presets">
@@ -215,6 +213,7 @@
             <div class="mode-tabs" role="tablist" aria-label="Render mode">
               <button data-preview-mode="tile" type="button">Tile</button>
               <button class="active" data-preview-mode="stretch" type="button">Stretch</button>
+              <button data-preview-mode="tile_stretch" type="button">Tile Plus Stretch</button>
               <button data-preview-mode="mirror" type="button">Mirror</button>
             </div>
           </div>

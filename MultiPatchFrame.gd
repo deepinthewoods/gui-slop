@@ -72,7 +72,7 @@ var _role_material: ShaderMaterial
 		rows = value
 		queue_redraw()
 
-@export_enum("tile", "stretch") var rail_mode: String = "tile":
+@export_enum("tile", "stretch", "tile_stretch") var rail_mode: String = "tile":
 	set(value):
 		rail_mode = value
 		queue_redraw()
@@ -131,7 +131,7 @@ var edge_bottom_fixed_runs: Array[Rect2i] = []
 var edge_left_fixed_runs: Array[Rect2i] = []
 var edge_right_fixed_runs: Array[Rect2i] = []
 
-@export_enum("tile", "stretch", "mirror") var edge_mode: String = "stretch":
+@export_enum("tile", "stretch", "mirror", "tile_stretch") var edge_mode: String = "stretch":
 	set(value):
 		edge_mode = value
 		queue_redraw()
@@ -261,11 +261,11 @@ func apply_patch_json(data: Dictionary) -> void:
 	if data.has("rails"):
 		var rails: Dictionary = data["rails"]
 		var preferred := String(rails.get("preferredMode", rail_mode))
-		rail_mode = "stretch" if preferred == "stretch" else "tile"
+		rail_mode = preferred if (preferred == "stretch" or preferred == "tile_stretch") else "tile"
 	if data.has("legacyRails"):
 		var legacy_rails: Dictionary = data["legacyRails"]
 		var legacy_preferred := String(legacy_rails.get("preferredMode", rail_mode))
-		rail_mode = "stretch" if legacy_preferred == "stretch" else "tile"
+		rail_mode = legacy_preferred if (legacy_preferred == "stretch" or legacy_preferred == "tile_stretch") else "tile"
 	queue_redraw()
 
 
@@ -400,24 +400,28 @@ func _fit_band_pair(start: int, end: int, total: int) -> Vector2i:
 
 
 func _corner_source_areas(bands: Dictionary) -> Dictionary:
-	var top_end := clampi(edge_top.end.x, 0, source_rect.size.x)
-	var bottom_end := clampi(edge_bottom.end.x, 0, source_rect.size.x)
-	var left_end := clampi(edge_left.end.y, 0, source_rect.size.y)
-	var right_end := clampi(edge_right.end.y, 0, source_rect.size.y)
-	var top_left_w := clampi(edge_top.position.x, 0, source_rect.size.x)
-	var bottom_left_w := clampi(edge_bottom.position.x, 0, source_rect.size.x)
-	var top_left_h := clampi(edge_left.position.y, 0, source_rect.size.y)
-	var top_right_h := clampi(edge_right.position.y, 0, source_rect.size.y)
-	if edge_top.size.x <= 0:
+	var top_basis := _edge_corner_basis(edge_top, edge_top_tile_runs)
+	var bottom_basis := _edge_corner_basis(edge_bottom, edge_bottom_tile_runs)
+	var left_basis := _edge_corner_basis(edge_left, edge_left_tile_runs)
+	var right_basis := _edge_corner_basis(edge_right, edge_right_tile_runs)
+	var top_end := clampi(top_basis.end.x, 0, source_rect.size.x)
+	var bottom_end := clampi(bottom_basis.end.x, 0, source_rect.size.x)
+	var left_end := clampi(left_basis.end.y, 0, source_rect.size.y)
+	var right_end := clampi(right_basis.end.y, 0, source_rect.size.y)
+	var top_left_w := clampi(top_basis.position.x, 0, source_rect.size.x)
+	var bottom_left_w := clampi(bottom_basis.position.x, 0, source_rect.size.x)
+	var top_left_h := clampi(left_basis.position.y, 0, source_rect.size.y)
+	var top_right_h := clampi(right_basis.position.y, 0, source_rect.size.y)
+	if top_basis.size.x <= 0:
 		top_left_w = int(bands["left"])
 		top_end = source_rect.size.x - int(bands["right"])
-	if edge_bottom.size.x <= 0:
+	if bottom_basis.size.x <= 0:
 		bottom_left_w = int(bands["left"])
 		bottom_end = source_rect.size.x - int(bands["right"])
-	if edge_left.size.y <= 0:
+	if left_basis.size.y <= 0:
 		top_left_h = int(bands["top"])
 		left_end = source_rect.size.y - int(bands["bottom"])
-	if edge_right.size.y <= 0:
+	if right_basis.size.y <= 0:
 		top_right_h = int(bands["top"])
 		right_end = source_rect.size.y - int(bands["bottom"])
 	return {
@@ -426,6 +430,15 @@ func _corner_source_areas(bands: Dictionary) -> Dictionary:
 		"bottom_left": Rect2i(0, left_end, bottom_left_w, source_rect.size.y - left_end),
 		"bottom_right": Rect2i(bottom_end, right_end, source_rect.size.x - bottom_end, source_rect.size.y - right_end),
 	}
+
+
+func _edge_corner_basis(area: Rect2i, tile_runs: Array[Rect2i]) -> Rect2i:
+	if tile_runs.is_empty():
+		return area
+	var basis := tile_runs[0]
+	for i: int in range(1, tile_runs.size()):
+		basis = _rect_union(basis, tile_runs[i])
+	return basis
 
 
 func _corner_dest_rects(corners: Dictionary, target_size: Vector2) -> Dictionary:
@@ -721,9 +734,9 @@ func _draw_edge_region(local_rect: Rect2i, dst: Rect2, tile_x: bool, tile_y: boo
 	if mode == "stretch":
 		draw_texture_rect_region(texture, dst, src)
 	elif tile_runs.size() > 0:
-		_draw_tiled_runs(tile_runs, dst, tile_x, tile_y, mode == "mirror")
+		_draw_tiled_runs(tile_runs, dst, tile_x, tile_y, mode == "mirror", mode == "tile_stretch")
 	else:
-		_draw_tiled_region(src, dst, tile_x, tile_y, mode == "mirror")
+		_draw_tiled_region(src, dst, tile_x, tile_y, mode == "mirror", mode == "tile_stretch")
 
 
 func _draw_region_if_valid(src: Rect2, dst: Rect2) -> void:
@@ -755,8 +768,8 @@ func _draw_multi_patch(target_size: Vector2) -> void:
 				continue
 			var horizontal_rail := (row == 0 or row == 4) and (col == 1 or col == 3)
 			var vertical_rail := (col == 0 or col == 4) and (row == 1 or row == 3)
-			if rail_mode == "tile" and (horizontal_rail or vertical_rail):
-				_draw_tiled_region(src, dst, horizontal_rail, vertical_rail)
+			if (rail_mode == "tile" or rail_mode == "tile_stretch") and (horizontal_rail or vertical_rail):
+				_draw_tiled_region(src, dst, horizontal_rail, vertical_rail, false, rail_mode == "tile_stretch")
 			else:
 				draw_texture_rect_region(texture, dst, src)
 
@@ -824,12 +837,83 @@ func _rect_intersection(a: Rect2i, b: Rect2i) -> Rect2i:
 	return Rect2i(x, y, x2 - x, y2 - y)
 
 
-func _draw_tiled_runs(runs: Array[Rect2i], dst: Rect2, tile_x: bool, tile_y: bool, mirror := false) -> void:
+func _run_axis_size(run: Rect2i, horizontal: bool) -> float:
+	return float(run.size.x if horizontal else run.size.y)
+
+
+func _repeated_run_source_size(runs: Array[Rect2i], count: int, horizontal: bool) -> float:
+	var total := 0.0
+	for i in range(count):
+		total += _run_axis_size(runs[i % runs.size()], horizontal)
+	return total
+
+
+func _tile_stretch_count(dest_size: float, tile_size: float) -> int:
+	if dest_size <= 0.0 or tile_size <= 0.0:
+		return 1
+	return maxi(1, int(round(dest_size / tile_size)))
+
+
+func _tile_stretch_run_count(runs: Array[Rect2i], dest_size: float, horizontal: bool) -> int:
+	var cycle_size := 0.0
+	for run: Rect2i in runs:
+		cycle_size += _run_axis_size(run, horizontal)
+	if dest_size <= 0.0 or cycle_size <= 0.0:
+		return 1
+	var average_size := cycle_size / float(runs.size())
+	var estimate := maxi(1, int(round(dest_size / average_size)))
+	var start := maxi(1, estimate - runs.size() - 2)
+	var end := maxi(start, estimate + runs.size() + 2)
+	var best_count := start
+	var best_diff := INF
+	for count in range(start, end + 1):
+		var source_size := _repeated_run_source_size(runs, count, horizontal)
+		var diff := absf(source_size - dest_size)
+		if diff < best_diff:
+			best_diff = diff
+			best_count = count
+	return best_count
+
+
+func _draw_tile_stretch_runs(runs: Array[Rect2i], dst: Rect2, tile_x: bool, tile_y: bool) -> void:
 	var valid_runs: Array[Rect2i] = []
 	for run: Rect2i in runs:
 		if run.size.x > 0 and run.size.y > 0:
 			valid_runs.append(run)
 	if valid_runs.is_empty():
+		return
+
+	var horizontal := tile_x
+	var dst_start := dst.position.x if horizontal else dst.position.y
+	var dst_size := dst.size.x if horizontal else dst.size.y
+	var count := _tile_stretch_run_count(valid_runs, dst_size, horizontal)
+	var source_size := _repeated_run_source_size(valid_runs, count, horizontal)
+	if source_size <= 0.0:
+		return
+	var scale := dst_size / source_size
+	var dst_end := dst_start + dst_size
+	var position := dst_start
+	for tile_index in range(count):
+		var run := valid_runs[tile_index % valid_runs.size()]
+		var step := _run_axis_size(run, horizontal)
+		var draw_size := dst_end - position if tile_index == count - 1 else step * scale
+		var source_rect := _source_rect(run)
+		if horizontal:
+			draw_texture_rect_region(texture, Rect2(position, dst.position.y, draw_size, dst.size.y), source_rect)
+		else:
+			draw_texture_rect_region(texture, Rect2(dst.position.x, position, dst.size.x, draw_size), source_rect)
+		position += draw_size
+
+
+func _draw_tiled_runs(runs: Array[Rect2i], dst: Rect2, tile_x: bool, tile_y: bool, mirror := false, stretch_tiles := false) -> void:
+	var valid_runs: Array[Rect2i] = []
+	for run: Rect2i in runs:
+		if run.size.x > 0 and run.size.y > 0:
+			valid_runs.append(run)
+	if valid_runs.is_empty():
+		return
+	if stretch_tiles:
+		_draw_tile_stretch_runs(valid_runs, dst, tile_x, tile_y)
 		return
 
 	var horizontal := tile_x
@@ -869,7 +953,29 @@ func _draw_tiled_runs(runs: Array[Rect2i], dst: Rect2, tile_x: bool, tile_y: boo
 		tile_index += 1
 
 
-func _draw_tiled_region(src: Rect2, dst: Rect2, tile_x: bool, tile_y: bool, mirror := false) -> void:
+func _draw_tile_stretch_region(src: Rect2, dst: Rect2, tile_x: bool, tile_y: bool) -> void:
+	if src.size.x <= 0.0 or src.size.y <= 0.0 or dst.size.x <= 0.0 or dst.size.y <= 0.0:
+		return
+	if not tile_x and not tile_y:
+		draw_texture_rect_region(texture, dst, src)
+		return
+	var count_x := _tile_stretch_count(dst.size.x, src.size.x) if tile_x else 1
+	var count_y := _tile_stretch_count(dst.size.y, src.size.y) if tile_y else 1
+	var tile_w := dst.size.x / float(count_x) if tile_x else dst.size.x
+	var tile_h := dst.size.y / float(count_y) if tile_y else dst.size.y
+	for row in range(count_y):
+		for col in range(count_x):
+			var x := dst.position.x + float(col) * tile_w
+			var y := dst.position.y + float(row) * tile_h
+			var draw_w := dst.end.x - x if col == count_x - 1 else tile_w
+			var draw_h := dst.end.y - y if row == count_y - 1 else tile_h
+			draw_texture_rect_region(texture, Rect2(x, y, draw_w, draw_h), src)
+
+
+func _draw_tiled_region(src: Rect2, dst: Rect2, tile_x: bool, tile_y: bool, mirror := false, stretch_tiles := false) -> void:
+	if stretch_tiles:
+		_draw_tile_stretch_region(src, dst, tile_x, tile_y)
+		return
 	var step_x := src.size.x if tile_x else dst.size.x
 	var step_y := src.size.y if tile_y else dst.size.y
 	var tile_index := 0

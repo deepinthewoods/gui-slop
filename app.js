@@ -37,6 +37,7 @@ const els = {
   editorCanvas: document.getElementById("editorCanvas"),
   editorContextMenu: document.getElementById("editorContextMenu"),
   autoGuidesBtn: document.getElementById("autoGuidesBtn"),
+  autoSideInputs: [...document.querySelectorAll("[data-auto-side]")],
   sliceThreshold: document.getElementById("sliceThreshold"),
   sliceThresholdOut: document.getElementById("sliceThresholdOut"),
   sliceBridgeGap: document.getElementById("sliceBridgeGap"),
@@ -82,16 +83,17 @@ const state = {
   hasProcessedPatches: false,
   processingBusy: false,
   sliceScans: new Map(),
-  repeatScans: new Map(),
   manualMode: false,
   sourceDrag: null,
   areaDrag: null,
+  editorZoom: 2,
   previewMode: "stretch",
-  autoMode: "stable",
+  autoMode: "sliceScan",
 };
 
 const EDGE_SIDES = ["top", "bottom", "left", "right"];
-const AUTO_AREA_MODES = new Set(["stable", "compact", "cornerSafe", "cornerSafeExpanded", "projection", "sliceScan"]);
+const EDITOR_ZOOM_MIN = 1;
+const EDITOR_ZOOM_MAX = 12;
 const PROCESS_PRESETS = {
   fastAverage: "Fast Avg",
   fastMedian: "Fast Median",
@@ -102,7 +104,12 @@ const PROCESS_PRESETS = {
   morphological: "Morpho",
 };
 const STORAGE_KEY = "frame-patch-lab:v2";
+const IMPORTED_IMAGE_GAP = 12;
+const IMAGE_FILE_EXTENSION_RE = /\.(apng|avif|bmp|gif|jpe?g|png|webp)$/i;
 let pendingSaveTimer = null;
+let pendingFileImportToken = 0;
+let pendingImageLoadToken = 0;
+let windowFileDragDepth = 0;
 
 const sourceCtx = els.sourceCanvas.getContext("2d", { willReadFrequently: true });
 const editorCtx = els.editorCanvas.getContext("2d", { willReadFrequently: true });
@@ -210,46 +217,186 @@ function initImageOptions() {
   }
 }
 
-function loadImage(src, name) {
+function imageElementWidth(image) {
+  return image.naturalWidth || image.width || 0;
+}
+
+function imageElementHeight(image) {
+  return image.naturalHeight || image.height || 0;
+}
+
+function activateImage(image, name, alreadyFlushed = false) {
+  const width = imageElementWidth(image);
+  const height = imageElementHeight(image);
+  if (width <= 0 || height <= 0) {
+    setStatus(`Could not load ${name}`);
+    return;
+  }
+
+  pendingImageLoadToken += 1;
+  if (!alreadyFlushed) flushPendingSave();
+  state.imageName = name;
+  state.sourceImage = image;
+  state.originalCanvas.width = width;
+  state.originalCanvas.height = height;
+  state.keyedCanvas.width = width;
+  state.keyedCanvas.height = height;
+  state.maskCanvas.width = width;
+  state.maskCanvas.height = height;
+  resizeCanvasBitmap(els.sourceCanvas, width, height);
+
+  const ctx = state.originalCanvas.getContext("2d", { willReadFrequently: true });
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(image, 0, 0);
+  state.originalData = ctx.getImageData(0, 0, width, height);
+  state.frames = [];
+  state.patches.clear();
+  state.edgeAreas.clear();
+  state.frameSettings.clear();
+  state.selectedSlice = null;
+  clearProcessedPatches(false);
+  state.sliceScans.clear();
+  state.selectedId = null;
+  state.sourceHasAlpha = detectExistingAlpha(state.originalData);
+
+  const roleColors = sampleRoleColors(state.originalData);
+  els.mainColor.value = rgbToHex(roleColors.main);
+  els.secondaryColor.value = rgbToHex(roleColors.secondary);
+  applyUiSettings(getStoredImageRecord()?.settings);
+  setStatus(`${name} loaded, ${width}x${height}`);
+  processImage();
+  detectFrames();
+}
+
+function revokeUrls(urls) {
+  for (const url of urls || []) URL.revokeObjectURL(url);
+}
+
+function loadImage(src, name, cleanupUrls = []) {
+  pendingFileImportToken += 1;
+  const loadToken = ++pendingImageLoadToken;
   flushPendingSave();
   setStatus(`Loading ${name}...`);
   const img = new Image();
   img.onload = () => {
-    state.imageName = name;
-    state.sourceImage = img;
-    state.originalCanvas.width = img.naturalWidth;
-    state.originalCanvas.height = img.naturalHeight;
-    state.keyedCanvas.width = img.naturalWidth;
-    state.keyedCanvas.height = img.naturalHeight;
-    state.maskCanvas.width = img.naturalWidth;
-    state.maskCanvas.height = img.naturalHeight;
-    resizeCanvasBitmap(els.sourceCanvas, img.naturalWidth, img.naturalHeight);
-
-    const ctx = state.originalCanvas.getContext("2d", { willReadFrequently: true });
-    ctx.clearRect(0, 0, img.naturalWidth, img.naturalHeight);
-    ctx.drawImage(img, 0, 0);
-    state.originalData = ctx.getImageData(0, 0, img.naturalWidth, img.naturalHeight);
-    state.frames = [];
-    state.patches.clear();
-    state.edgeAreas.clear();
-    state.frameSettings.clear();
-    state.selectedSlice = null;
-    clearProcessedPatches(false);
-    state.sliceScans.clear();
-    state.repeatScans.clear();
-    state.selectedId = null;
-    state.sourceHasAlpha = detectExistingAlpha(state.originalData);
-
-    const roleColors = sampleRoleColors(state.originalData);
-    els.mainColor.value = rgbToHex(roleColors.main);
-    els.secondaryColor.value = rgbToHex(roleColors.secondary);
-    applyUiSettings(getStoredImageRecord()?.settings);
-    setStatus(`${name} loaded, ${img.naturalWidth}x${img.naturalHeight}`);
-    processImage();
-    detectFrames();
+    if (loadToken !== pendingImageLoadToken) {
+      revokeUrls(cleanupUrls);
+      return;
+    }
+    activateImage(img, name, true);
+    revokeUrls(cleanupUrls);
   };
-  img.onerror = () => setStatus(`Could not load ${name}`);
+  img.onerror = () => {
+    if (loadToken === pendingImageLoadToken) setStatus(`Could not load ${name}`);
+    revokeUrls(cleanupUrls);
+  };
   img.src = src;
+}
+
+function isImageFile(file) {
+  if (!file) return false;
+  return file.type.startsWith("image/") || IMAGE_FILE_EXTENSION_RE.test(file.name || "");
+}
+
+function imageFilesFromList(fileList) {
+  return Array.from(fileList || []).filter(isImageFile);
+}
+
+function loadFileImage(file) {
+  const url = URL.createObjectURL(file);
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ file, img, url });
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error(`Could not load ${file.name}`));
+    };
+    img.src = url;
+  });
+}
+
+function importedImageName(files) {
+  if (files.length === 1) return files[0].name;
+  const basenames = files.map((file) => file.name.replace(/\.[^.]+$/, ""));
+  if (basenames.length <= 3) return `${basenames.join(" + ")}.png`;
+  return `${basenames[0]} + ${basenames.length - 1} more.png`;
+}
+
+function composeImageSheet(images) {
+  const columns = images.length <= 2 ? images.length : Math.ceil(Math.sqrt(images.length));
+  const rows = Math.ceil(images.length / columns);
+  const columnWidths = Array(columns).fill(1);
+  const rowHeights = Array(rows).fill(1);
+
+  images.forEach((entry, index) => {
+    const column = index % columns;
+    const row = Math.floor(index / columns);
+    columnWidths[column] = Math.max(columnWidths[column], imageElementWidth(entry.img));
+    rowHeights[row] = Math.max(rowHeights[row], imageElementHeight(entry.img));
+  });
+
+  const xOffsets = [];
+  const yOffsets = [];
+  let width = 0;
+  let height = 0;
+  for (let column = 0; column < columns; column += 1) {
+    xOffsets[column] = width;
+    width += columnWidths[column] + (column < columns - 1 ? IMPORTED_IMAGE_GAP : 0);
+  }
+  for (let row = 0; row < rows; row += 1) {
+    yOffsets[row] = height;
+    height += rowHeights[row] + (row < rows - 1 ? IMPORTED_IMAGE_GAP : 0);
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  images.forEach((entry, index) => {
+    const column = index % columns;
+    const row = Math.floor(index / columns);
+    const imageWidth = imageElementWidth(entry.img);
+    const imageHeight = imageElementHeight(entry.img);
+    const x = xOffsets[column] + Math.floor((columnWidths[column] - imageWidth) / 2);
+    const y = yOffsets[row] + Math.floor((rowHeights[row] - imageHeight) / 2);
+    ctx.drawImage(entry.img, x, y);
+  });
+  return canvas;
+}
+
+async function loadImageFiles(fileList) {
+  const files = imageFilesFromList(fileList);
+  if (files.length === 0) {
+    setStatus("No image files found.");
+    return;
+  }
+
+  const importToken = ++pendingFileImportToken;
+  pendingImageLoadToken += 1;
+  setStatus(`Loading ${files.length} image${files.length === 1 ? "" : "s"}...`);
+  const results = await Promise.allSettled(files.map(loadFileImage));
+  const images = results
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => result.value);
+  const failedCount = results.length - images.length;
+
+  if (importToken !== pendingFileImportToken) {
+    revokeUrls(images.map((entry) => entry.url));
+    return;
+  }
+  if (images.length === 0) {
+    setStatus(`Could not load ${files.length === 1 ? files[0].name : "those images"}.`);
+    return;
+  }
+
+  const image = images.length === 1 ? images[0].img : composeImageSheet(images);
+  const name = importedImageName(images.map((entry) => entry.file));
+  activateImage(image, name);
+  revokeUrls(images.map((entry) => entry.url));
+  if (failedCount > 0) {
+    setStatus(`${name}: loaded ${images.length} image${images.length === 1 ? "" : "s"}, skipped ${failedCount}.`);
+  }
 }
 
 function classifyColorRole(r, g, b, a) {
@@ -454,8 +601,37 @@ function syncModeButtons(selector, attr, activeValue) {
   });
 }
 
-function normalizeAutoMode(mode) {
-  return AUTO_AREA_MODES.has(mode) ? mode : "stable";
+function normalizeAutoMode() {
+  return "sliceScan";
+}
+
+function normalizeAutoSideFlags(flags) {
+  const normalized = {};
+  for (const side of EDGE_SIDES) {
+    normalized[side] = flags?.[side] !== false;
+  }
+  return normalized;
+}
+
+function getAutoSideFlags() {
+  const flags = normalizeAutoSideFlags(null);
+  for (const input of els.autoSideInputs || []) {
+    const side = input.dataset.autoSide;
+    if (EDGE_SIDES.includes(side)) flags[side] = input.checked;
+  }
+  return flags;
+}
+
+function setAutoSideFlags(flags) {
+  const normalized = normalizeAutoSideFlags(flags);
+  for (const input of els.autoSideInputs || []) {
+    const side = input.dataset.autoSide;
+    if (EDGE_SIDES.includes(side)) input.checked = normalized[side];
+  }
+}
+
+function hasDisabledAutoSides(flags = getAutoSideFlags()) {
+  return EDGE_SIDES.some((side) => flags[side] === false);
 }
 
 function getUiSettings() {
@@ -476,6 +652,7 @@ function getUiSettings() {
     },
     areas: {
       autoMode: state.autoMode,
+      autoSides: getAutoSideFlags(),
       sliceThreshold: Number(els.sliceThreshold.value),
       sliceBridgeGap: Number(els.sliceBridgeGap.value),
       sliceCornerGuard: Number(els.sliceCornerGuard.value),
@@ -501,9 +678,9 @@ function applyUiSettings(settings) {
   setInputValue(els.sliceBridgeGap, settings.areas?.sliceBridgeGap);
   setInputValue(els.sliceCornerGuard, settings.areas?.sliceCornerGuard);
   setInputValue(els.sliceLengthLimit, settings.areas?.sliceLengthLimit);
+  setAutoSideFlags(settings.areas?.autoSides);
   if (settings.areas?.autoMode) state.autoMode = normalizeAutoMode(settings.areas.autoMode);
   if (settings.previewMode) state.previewMode = settings.previewMode;
-  syncModeButtons("[data-auto-mode]", "autoMode", state.autoMode);
   syncModeButtons("[data-preview-mode]", "previewMode", state.previewMode);
   updateControlLabels();
 }
@@ -766,7 +943,6 @@ function detectFrames() {
   updateControlLabels();
   const previousSelectedKey = getSelectedFrame() ? frameStorageKey(getSelectedFrame()) : null;
   state.sliceScans.clear();
-  state.repeatScans.clear();
   const width = state.keyedData.width;
   const height = state.keyedData.height;
   const alphaThreshold = Number(els.alphaThreshold.value);
@@ -1154,29 +1330,52 @@ function sideDefaultRect(frame, center, side) {
   return { x: centerRight, y: center.y, w: Math.max(1, frame.w - centerRight), h: center.h };
 }
 
-function suggestEdgeAreas(frame, mode = state.autoMode) {
-  if (mode === "repeatScan") {
-    const repeatAreas = suggestRepeatScanAreas(frame);
-    if (repeatAreas) return repeatAreas;
-    const sliceAreas = suggestSliceScanAreas(frame);
-    if (sliceAreas) return sliceAreas;
-  }
-  if (mode === "sliceScan") {
-    const sliceAreas = suggestSliceScanAreas(frame);
-    if (sliceAreas) return sliceAreas;
-  }
+function suggestEdgeAreas(frame) {
+  const sliceAreas = suggestSliceScanAreas(frame);
+  if (sliceAreas) return sliceAreas;
   const center = findTransparentCenterRect(frame);
-  const patch = suggestPatch(frame, mode);
-  const areas = patch
-    ? edgeAreasFromPatch(frame, center, patch)
-    : {
-        center: normalizeRect(frame, center, 1),
-        top: sideDefaultRect(frame, center, "top"),
-        bottom: sideDefaultRect(frame, center, "bottom"),
-        left: sideDefaultRect(frame, center, "left"),
-        right: sideDefaultRect(frame, center, "right"),
-      };
+  const areas = {
+    center: normalizeRect(frame, center, 1),
+    top: sideDefaultRect(frame, center, "top"),
+    bottom: sideDefaultRect(frame, center, "bottom"),
+    left: sideDefaultRect(frame, center, "left"),
+    right: sideDefaultRect(frame, center, "right"),
+  };
   return constrainEdgeAreas(frame, areas);
+}
+
+function suggestAutoEdgeAreas(frame, sideFlags = getAutoSideFlags()) {
+  const suggested = suggestEdgeAreas(frame);
+  const existing = state.edgeAreas.get(frame.id);
+  return applyAutoSideMask(frame, suggested, existing, sideFlags);
+}
+
+function suggestAutoPatch(frame, areas) {
+  return areas ? constrainPatch(frame, patchFromSliceScanAreas(frame, areas)) : suggestPatch(frame);
+}
+
+function applyAutoSideMask(frame, suggested, existing, sideFlags) {
+  if (!suggested || !existing || !hasDisabledAutoSides(sideFlags)) return suggested;
+  const merged = cloneAreas(suggested);
+  for (const side of EDGE_SIDES) {
+    if (sideFlags[side] !== false) continue;
+    copyAutoSideFromExisting(merged, existing, side);
+  }
+  return constrainEdgeAreas(frame, merged);
+}
+
+function copyAutoSideFromExisting(target, source, side) {
+  if (source[side]) target[side] = cloneRect(source[side]);
+  setRunCollectionSide(target, "tileRuns", side, source.tileRuns?.[side] || []);
+  setRunCollectionSide(target, "fixedRuns", side, source.fixedRuns?.[side] || []);
+  if (source.medallions?.[side]) {
+    target.medallions ||= {};
+    target.medallions[side] = cloneRect(source.medallions[side]);
+  } else if (target.medallions) {
+    delete target.medallions[side];
+    if (Object.keys(target.medallions).length === 0) delete target.medallions;
+  }
+  setExplicitFixedSide(target, side, source.fixedRunsExplicit === true || source.fixedRunsExplicitSides?.[side] === true);
 }
 
 function edgeAreasFromPatch(frame, center, patch) {
@@ -1401,7 +1600,8 @@ function constrainEdgeAreas(frame, areas) {
           .map((rect) => rectIntersection(normalizeRect(frame, rect, 1), constrained[side]))
           .filter((rect) => rect && rect.w > 0 && rect.h > 0)
       : gapRuns;
-    const mergedRuns = mergeFixedRunsForArea(normalizedRuns, axis);
+    const clippedRuns = removeFixedRunTileOverlaps(normalizedRuns, tileRuns[side] || [], axis);
+    const mergedRuns = mergeFixedRunsForArea(clippedRuns, axis);
     if (mergedRuns.length > 0) fixedRuns[side] = mergedRuns;
   }
   if (Object.keys(constrainedExplicitFixedSides).length > 0) constrained.fixedRunsExplicitSides = constrainedExplicitFixedSides;
@@ -1456,15 +1656,25 @@ function fitBandPair(start, end, total) {
   return [a, b];
 }
 
+function edgeCornerBasis(areas, side) {
+  const runs = areas.tileRuns?.[side] || [];
+  if (runs.length === 0) return areas[side] || null;
+  return runs.reduce((basis, run) => basis ? rectUnion(basis, run) : cloneRect(run), null);
+}
+
 function getCornerSourceAreas(frame, areas, bands = getEdgeRenderBands(frame, areas)) {
-  const topEnd = clamp(rectEndX(areas.top || { x: bands.left, w: Math.max(1, frame.w - bands.left - bands.right) }), 0, frame.w);
-  const bottomEnd = clamp(rectEndX(areas.bottom || { x: bands.left, w: Math.max(1, frame.w - bands.left - bands.right) }), 0, frame.w);
-  const leftEnd = clamp(rectEndY(areas.left || { y: bands.top, h: Math.max(1, frame.h - bands.top - bands.bottom) }), 0, frame.h);
-  const rightEnd = clamp(rectEndY(areas.right || { y: bands.top, h: Math.max(1, frame.h - bands.top - bands.bottom) }), 0, frame.h);
-  const topLeftW = clamp(areas.top?.x ?? bands.left, 0, frame.w);
-  const bottomLeftW = clamp(areas.bottom?.x ?? bands.left, 0, frame.w);
-  const topLeftH = clamp(areas.left?.y ?? bands.top, 0, frame.h);
-  const topRightH = clamp(areas.right?.y ?? bands.top, 0, frame.h);
+  const topBasis = edgeCornerBasis(areas, "top");
+  const bottomBasis = edgeCornerBasis(areas, "bottom");
+  const leftBasis = edgeCornerBasis(areas, "left");
+  const rightBasis = edgeCornerBasis(areas, "right");
+  const topEnd = clamp(rectEndX(topBasis || { x: bands.left, w: Math.max(1, frame.w - bands.left - bands.right) }), 0, frame.w);
+  const bottomEnd = clamp(rectEndX(bottomBasis || { x: bands.left, w: Math.max(1, frame.w - bands.left - bands.right) }), 0, frame.w);
+  const leftEnd = clamp(rectEndY(leftBasis || { y: bands.top, h: Math.max(1, frame.h - bands.top - bands.bottom) }), 0, frame.h);
+  const rightEnd = clamp(rectEndY(rightBasis || { y: bands.top, h: Math.max(1, frame.h - bands.top - bands.bottom) }), 0, frame.h);
+  const topLeftW = clamp(topBasis?.x ?? bands.left, 0, frame.w);
+  const bottomLeftW = clamp(bottomBasis?.x ?? bands.left, 0, frame.w);
+  const topLeftH = clamp(leftBasis?.y ?? bands.top, 0, frame.h);
+  const topRightH = clamp(rightBasis?.y ?? bands.top, 0, frame.h);
   return {
     topLeft: { x: 0, y: 0, w: topLeftW, h: topLeftH },
     topRight: { x: topEnd, y: 0, w: frame.w - topEnd, h: topRightH },
@@ -1507,321 +1717,6 @@ function createSliceScanSuggestion(frame) {
   const constrained = constrainEdgeAreas(frame, areas);
   state.sliceScans.set(frame.id, scans);
   return { areas: constrained, scans };
-}
-
-function suggestRepeatScanAreas(frame) {
-  const suggestion = createRepeatScanSuggestion(frame);
-  return suggestion ? suggestion.areas : null;
-}
-
-function suggestRepeatScanPatch(frame) {
-  const suggestion = createRepeatScanSuggestion(frame);
-  if (!suggestion) return null;
-  return constrainPatch(frame, patchFromSliceScanAreas(frame, suggestion.areas));
-}
-
-function createRepeatScanSuggestion(frame) {
-  if (!state.originalData || !state.keyedData) return null;
-  const center = normalizeRect(frame, findTransparentCenterRect(frame), 1);
-  const scans = {};
-  let repeatedSides = 0;
-  for (const side of EDGE_SIDES) {
-    scans[side] = buildSideRepeatScan(frame, center, side);
-    if (scans[side].period && scans[side].repeatableRuns.length >= 2) repeatedSides += 1;
-  }
-  if (repeatedSides === 0) return null;
-
-  const areas = {
-    center,
-    top: sideAreaFromRepeatScan(frame, center, "top", scans.top),
-    bottom: sideAreaFromRepeatScan(frame, center, "bottom", scans.bottom),
-    left: sideAreaFromRepeatScan(frame, center, "left", scans.left),
-    right: sideAreaFromRepeatScan(frame, center, "right", scans.right),
-  };
-
-  areas.tileRuns = buildRepeatScanTileRuns(areas, scans);
-  areas.fixedRuns = buildRepeatScanFixedRuns(areas, scans);
-  areas.fixedRunsExplicit = true;
-  areas.medallions = representativeFixedMedallions(areas.fixedRuns, areas);
-
-  const constrained = constrainEdgeAreas(frame, areas);
-  state.repeatScans.set(frame.id, scans);
-  return { areas: constrained, scans };
-}
-
-function buildSideRepeatScan(frame, center, side) {
-  const scan = buildSideSliceScan(frame, center, side);
-  const support = selectRepeatSupport(scan);
-  const period = chooseRepeatPeriod(scan, support);
-  if (!period) {
-    return {
-      ...scan,
-      support,
-      period: null,
-      periodScore: Number.POSITIVE_INFINITY,
-      periodCoverage: 0,
-      repeatableRuns: [],
-    };
-  }
-
-  const repeatableRuns = chooseRepeatRuns(scan, support, period);
-  if (repeatableRuns.length < 2) {
-    return {
-      ...scan,
-      support,
-      period: null,
-      periodScore: Number.POSITIVE_INFINITY,
-      periodCoverage: 0,
-      repeatableRuns: [],
-    };
-  }
-
-  return {
-    ...scan,
-    support,
-    period: period.period,
-    periodScore: period.score,
-    periodCoverage: period.coverage,
-    repeatableRuns,
-  };
-}
-
-function selectRepeatSupport(scan) {
-  const fallback = {
-    start: scan.validStart,
-    end: Math.max(scan.validStart + 1, scan.validEnd),
-  };
-  const span = drawableSpan(scan) || fallback;
-  const length = span.end - span.start;
-  if (length <= 6) return span;
-
-  const guard = Math.round((scan.validEnd - scan.validStart) * getSliceCornerGuardRatio());
-  if (guard <= 0 || length - guard * 2 < Math.max(6, Math.round(length * 0.45))) return span;
-  return {
-    start: span.start + guard,
-    end: span.end - guard,
-  };
-}
-
-function chooseRepeatPeriod(scan, support) {
-  const supportLength = support.end - support.start;
-  if (!scan.profiles || supportLength < 8) return null;
-  const minPeriod = 3;
-  const maxPeriod = Math.min(96, Math.floor(supportLength / 2));
-  if (maxPeriod < minPeriod) return null;
-
-  const candidates = [];
-  for (let period = minPeriod; period <= maxPeriod; period += 1) {
-    const candidate = scoreRepeatPeriod(scan, support, period);
-    if (candidate) candidates.push(candidate);
-  }
-  if (candidates.length === 0) return null;
-
-  candidates.sort((a, b) => (a.score - b.score) || (a.period - b.period));
-  const best = candidates[0];
-  if (best.score > repeatScoreLimit(scan, support)) return null;
-  if (supportLength / best.period < 2.25) return null;
-
-  const slack = best.score * 1.18 + 0.25;
-  return candidates
-    .filter((candidate) => candidate.score <= slack && candidate.coverage >= Math.max(0.35, best.coverage * 0.85))
-    .sort((a, b) => a.period - b.period)[0];
-}
-
-function scoreRepeatPeriod(scan, support, period) {
-  const possible = support.end - support.start - period;
-  if (possible <= 0) return null;
-  const alphaThreshold = Number(els.alphaThreshold.value);
-  const scores = [];
-  for (let i = support.start; i < support.end - period; i += 1) {
-    if (!scan.drawable[i] || !scan.drawable[i + period]) continue;
-    const distance = compareSliceProfiles(scan.profiles[i], scan.profiles[i + period], alphaThreshold);
-    if (Number.isFinite(distance.score)) scores.push(distance.score);
-  }
-
-  const minPairs = Math.max(3, Math.round(possible * 0.35));
-  if (scores.length < minPairs) return null;
-  scores.sort((a, b) => a - b);
-  const median = percentileSorted(scores, 0.5);
-  const p80 = percentileSorted(scores, 0.8);
-  const p95 = percentileSorted(scores, 0.95);
-  const coverage = scores.length / possible;
-  const score = median * 0.65 + p80 * 0.22 + p95 * 0.08 + (1 - coverage) * 6;
-  return {
-    period,
-    score,
-    median,
-    p80,
-    p95,
-    coverage,
-    pairs: scores.length,
-  };
-}
-
-function repeatScoreLimit(scan, support) {
-  const adaptive = Number.isFinite(scan.threshold) ? scan.threshold : 6;
-  const shortSpanScale = support.end - support.start < 24 ? 1.25 : 1;
-  return clamp(adaptive * 1.8 * shortSpanScale, 2.5, 18);
-}
-
-function chooseRepeatRuns(scan, support, periodInfo) {
-  const period = periodInfo.period;
-  const limit = Math.max(
-    repeatScoreLimit(scan, support),
-    periodInfo.score * 1.55 + 0.4,
-    periodInfo.p80 * 1.35 + 0.25,
-  );
-  let best = null;
-
-  for (let offset = 0; offset < period; offset += 1) {
-    const runs = [];
-    let scoreTotal = 0;
-    for (let start = support.start + offset; start + period <= support.end; start += period) {
-      const quality = scoreRepeatWindow(scan, support, start, period);
-      if (!quality || quality.validRatio < 0.55 || quality.score > limit) continue;
-      runs.push({ start, end: start + period, score: quality.score });
-      scoreTotal += quality.score;
-    }
-    if (runs.length < 2) continue;
-    const first = runs[0];
-    const last = runs[runs.length - 1];
-    const edgeWaste = (first.start - support.start) + (support.end - last.end);
-    const averageScore = scoreTotal / runs.length;
-    const candidate = { runs, covered: runs.length * period, edgeWaste, averageScore };
-    if (!best ||
-      candidate.covered > best.covered ||
-      (candidate.covered === best.covered && candidate.edgeWaste < best.edgeWaste) ||
-      (candidate.covered === best.covered && candidate.edgeWaste === best.edgeWaste && candidate.averageScore < best.averageScore)) {
-      best = candidate;
-    }
-  }
-
-  return best ? best.runs : [];
-}
-
-function scoreRepeatWindow(scan, support, start, period) {
-  const alphaThreshold = Number(els.alphaThreshold.value);
-  const scores = [];
-  let drawableCount = 0;
-  for (let i = start; i < start + period; i += 1) {
-    if (scan.drawable[i]) drawableCount += 1;
-    if (i - period >= support.start && scan.drawable[i] && scan.drawable[i - period]) {
-      const previous = compareSliceProfiles(scan.profiles[i], scan.profiles[i - period], alphaThreshold);
-      if (Number.isFinite(previous.score)) scores.push(previous.score);
-    }
-    if (i + period < support.end && scan.drawable[i] && scan.drawable[i + period]) {
-      const next = compareSliceProfiles(scan.profiles[i], scan.profiles[i + period], alphaThreshold);
-      if (Number.isFinite(next.score)) scores.push(next.score);
-    }
-  }
-  if (scores.length === 0) return null;
-  scores.sort((a, b) => a - b);
-  return {
-    score: percentileSorted(scores, 0.65),
-    validRatio: drawableCount / period,
-  };
-}
-
-function sideAreaFromRepeatScan(frame, center, side, scan) {
-  const support = scan.period ? scan.support : selectSliceSupport(scan);
-  const centerBottom = rectEndY(center);
-  const centerRight = rectEndX(center);
-  let rect;
-  if (side === "top") {
-    rect = { x: support.start, y: 0, w: support.end - support.start, h: Math.max(1, center.y) };
-  } else if (side === "bottom") {
-    rect = { x: support.start, y: centerBottom, w: support.end - support.start, h: Math.max(1, frame.h - centerBottom) };
-  } else if (side === "left") {
-    rect = { x: 0, y: support.start, w: Math.max(1, center.x), h: support.end - support.start };
-  } else {
-    rect = { x: centerRight, y: support.start, w: Math.max(1, frame.w - centerRight), h: support.end - support.start };
-  }
-  return fitAreaToAlpha(frame, side, rect, center);
-}
-
-function buildRepeatScanTileRuns(areas, scans) {
-  const tileRuns = {};
-  for (const side of EDGE_SIDES) {
-    const runs = repeatScanTileRunsForSide(areas[side], scans[side], side);
-    if (runs.length > 0) tileRuns[side] = runs;
-  }
-  return tileRuns;
-}
-
-function buildRepeatScanFixedRuns(areas, scans) {
-  const fixedRuns = {};
-  for (const side of EDGE_SIDES) {
-    const mergedRuns = repeatScanFixedRunsForSide(areas[side], scans[side], areas.tileRuns?.[side] || [], side);
-    if (mergedRuns.length > 0) fixedRuns[side] = mergedRuns;
-  }
-  return fixedRuns;
-}
-
-function repeatScanTileRunsForSide(area, scan, side) {
-  if (!scan || !area) return [];
-  const horizontal = side === "top" || side === "bottom";
-  const areaStart = horizontal ? area.x : area.y;
-  const areaEnd = horizontal ? rectEndX(area) : rectEndY(area);
-  const minSize = Math.max(2, Math.round((areaEnd - areaStart) * 0.015));
-  const sourceRuns = scan.period ? representativeRepeatRuns(scan.repeatableRuns) : scan.stableRuns;
-  return sourceRuns
-    .map((run) => ({
-      start: clamp(run.start, areaStart, areaEnd),
-      end: clamp(run.end, areaStart, areaEnd),
-    }))
-    .filter((run) => run.end - run.start >= minSize)
-    .map((run) => horizontal
-      ? { x: run.start, y: area.y, w: run.end - run.start, h: area.h }
-      : { x: area.x, y: run.start, w: area.w, h: run.end - run.start });
-}
-
-function repeatScanFixedRunsForSide(area, scan, tileRuns, side) {
-  if (!area) return [];
-  const axis = sideAxis(side);
-  const runs = scan?.period
-    ? fixedRunsBetweenRepeatGroups(area, scan.repeatableRuns, axis)
-    : fixedRunsForTileGaps(area, tileRuns || [], axis);
-  return mergeFixedRunsForArea(runs, axis);
-}
-
-function representativeRepeatRuns(runs) {
-  return groupContiguousRepeatRuns(runs)
-    .map((group) => group[Math.floor(group.length / 2)]);
-}
-
-function fixedRunsBetweenRepeatGroups(area, runs, axis) {
-  const groups = groupContiguousRepeatRuns(runs);
-  if (groups.length < 2) return [];
-  const areaStart = rectPrimaryStart(area, axis);
-  const areaEnd = rectPrimaryEnd(area, axis);
-  const gaps = [];
-  for (let i = 0; i < groups.length - 1; i += 1) {
-    const current = groups[i];
-    const next = groups[i + 1];
-    const start = clamp(current[current.length - 1].end, areaStart, areaEnd);
-    const end = clamp(next[0].start, areaStart, areaEnd);
-    if (end > start) gaps.push(rectFromPrimarySpan(area, axis, start, end));
-  }
-  return gaps;
-}
-
-function groupContiguousRepeatRuns(runs) {
-  const sorted = runs
-    .filter((run) => run && run.end > run.start)
-    .map((run) => ({ ...run }))
-    .sort((a, b) => a.start - b.start);
-  if (sorted.length <= 1) return sorted.length === 1 ? [sorted] : [];
-  const groups = [[sorted[0]]];
-  for (let i = 1; i < sorted.length; i += 1) {
-    const previous = groups[groups.length - 1][groups[groups.length - 1].length - 1];
-    const current = sorted[i];
-    if (current.start <= previous.end + 1) {
-      groups[groups.length - 1].push(current);
-    } else {
-      groups.push([current]);
-    }
-  }
-  return groups;
 }
 
 function buildSideSliceScan(frame, center, side) {
@@ -1867,9 +1762,12 @@ function buildSideSliceScan(frame, center, side) {
     }
   }
 
+  const supportMassFloor = adaptiveMassFloor(mass, transparentInside);
+  const supportDrawable = mass.map((value, i) => transparentInside[i] && value >= supportMassFloor);
   const massFloor = adaptiveMassFloor(mass, validInside);
   const drawable = mass.map((value, i) => validInside[i] && value >= massFloor);
-  const threshold = adaptiveLowThreshold(pairScores) * getSliceThresholdScale();
+  const baseThreshold = adaptiveLowThreshold(pairScores);
+  const threshold = baseThreshold * getSliceThresholdScale();
   const stableRuns = findSliceStableRuns({
     forward,
     drawable,
@@ -1885,7 +1783,9 @@ function buildSideSliceScan(frame, center, side) {
     validEnd: validRange.end,
     profiles,
     mass,
+    supportMassFloor,
     massFloor,
+    supportDrawable,
     validInside,
     drawable,
     alphaStart,
@@ -1894,6 +1794,7 @@ function buildSideSliceScan(frame, center, side) {
     lengthGate,
     forward,
     backward,
+    baseThreshold,
     threshold,
     stableRuns,
   };
@@ -2101,20 +2002,52 @@ function mergeSliceRuns(runs, maxGap) {
 }
 
 function sideAreaFromSliceScan(frame, center, side, scan) {
-  const support = selectSliceSupport(scan);
+  const support = selectSideAreaSupport(scan);
+  const cross = selectSideCrossSpan(scan);
   const centerBottom = rectEndY(center);
   const centerRight = rectEndX(center);
+  const crossStart = cross?.start ?? 0;
+  const crossSize = cross ? Math.max(1, cross.end - cross.start) : null;
   let rect;
   if (side === "top") {
-    rect = { x: support.start, y: 0, w: support.end - support.start, h: Math.max(1, center.y) };
+    rect = { x: support.start, y: crossStart, w: support.end - support.start, h: crossSize ?? Math.max(1, center.y) };
   } else if (side === "bottom") {
-    rect = { x: support.start, y: centerBottom, w: support.end - support.start, h: Math.max(1, frame.h - centerBottom) };
+    const h = crossSize ?? Math.max(1, frame.h - centerBottom);
+    rect = { x: support.start, y: cross ? frame.h - cross.end : centerBottom, w: support.end - support.start, h };
   } else if (side === "left") {
-    rect = { x: 0, y: support.start, w: Math.max(1, center.x), h: support.end - support.start };
+    rect = { x: crossStart, y: support.start, w: crossSize ?? Math.max(1, center.x), h: support.end - support.start };
   } else {
-    rect = { x: centerRight, y: support.start, w: Math.max(1, frame.w - centerRight), h: support.end - support.start };
+    const w = crossSize ?? Math.max(1, frame.w - centerRight);
+    rect = { x: cross ? frame.w - cross.end : centerRight, y: support.start, w, h: support.end - support.start };
   }
-  return fitAreaToAlpha(frame, side, rect, center);
+  return normalizeRect(frame, rect, 1);
+}
+
+function selectSideAreaSupport(scan) {
+  const fallback = {
+    start: scan.validStart,
+    end: Math.max(scan.validStart + 1, scan.validEnd),
+  };
+  if (scan.validEnd <= scan.validStart + 1) return fallback;
+  return drawableSpan(scan, scan.supportDrawable || scan.drawable) || fallback;
+}
+
+function selectSideCrossSpan(scan) {
+  if (!scan || scan.thickness <= 0) return null;
+  const drawable = scan.supportDrawable || scan.drawable;
+  const starts = [];
+  const ends = [];
+  for (let i = scan.validStart; i < scan.validEnd; i += 1) {
+    if (!drawable[i] || scan.alphaLength[i] <= 0 || scan.alphaStart[i] === null || scan.alphaEnd[i] === null) continue;
+    starts.push(scan.alphaStart[i]);
+    ends.push(scan.alphaEnd[i]);
+  }
+  if (starts.length === 0) return null;
+  starts.sort((a, b) => a - b);
+  ends.sort((a, b) => a - b);
+  const start = clamp(Math.floor(percentileSorted(starts, 0.5)), 0, Math.max(0, scan.thickness - 1));
+  const end = clamp(Math.ceil(percentileSorted(ends, 0.5)), start + 1, scan.thickness);
+  return { start, end };
 }
 
 function selectSliceSupport(scan) {
@@ -2124,9 +2057,10 @@ function selectSliceSupport(scan) {
   };
   if (scan.validEnd <= scan.validStart + 1) return fallback;
 
-  const massSpan = drawableSpan(scan) || fallback;
+  const supportDrawable = scan.supportDrawable || scan.drawable;
+  const massSpan = drawableSpan(scan, supportDrawable) || fallback;
   const usefulRuns = scan.stableRuns.filter((run) => run.end > massSpan.start && run.start < massSpan.end);
-  if (usefulRuns.length === 0) return massSpan;
+  if (usefulRuns.length === 0) return bestFallbackSliceSupport(scan, massSpan, supportDrawable);
 
   const groups = groupSliceRunsByBridge(usefulRuns, massSpan);
   const selected = selectSliceRunGroup(groups, massSpan);
@@ -2137,6 +2071,47 @@ function selectSliceSupport(scan) {
     start: clamp(first.start - margin, massSpan.start, massSpan.end - 1),
     end: clamp(last.end + margin, massSpan.start + 1, massSpan.end),
   };
+}
+
+function bestFallbackSliceSupport(scan, span, drawable = scan.drawable) {
+  let best = null;
+  for (let i = span.start; i < span.end; i += 1) {
+    if (!drawable[i]) continue;
+    const left = i > span.start && drawable[i - 1] && Number.isFinite(scan.forward[i - 1]) ? scan.forward[i - 1] : null;
+    const right = i < span.end - 1 && drawable[i + 1] && Number.isFinite(scan.forward[i]) ? scan.forward[i] : null;
+    if (left === null || right === null) continue;
+    const score = Math.max(left, right) * 0.7 + ((left + right) / 2) * 0.3;
+    if (!best || score < best.score) {
+      best = { index: i, score };
+    }
+  }
+  if (best) return onePixelSpanAround(best.index, span);
+
+  for (let i = span.start; i < span.end; i += 1) {
+    if (!drawable[i]) continue;
+    const left = i > span.start && drawable[i - 1] && Number.isFinite(scan.forward[i - 1]) ? scan.forward[i - 1] : null;
+    const right = i < span.end - 1 && drawable[i + 1] && Number.isFinite(scan.forward[i]) ? scan.forward[i] : null;
+    const score = Math.min(left ?? Number.POSITIVE_INFINITY, right ?? Number.POSITIVE_INFINITY);
+    if (!Number.isFinite(score)) continue;
+    if (!best || score < best.score) best = { index: i, score };
+  }
+  if (best) return onePixelSpanAround(best.index, span);
+
+  for (let i = span.start; i < span.end - 1; i += 1) {
+    if (!Number.isFinite(scan.forward[i])) continue;
+    if (!best || scan.forward[i] < best.score) {
+      best = { index: i, score: scan.forward[i] };
+    }
+  }
+  if (best) return onePixelSpanAround(best.index, span);
+
+  return onePixelSpanAround(span.start, span);
+}
+
+function onePixelSpanAround(index, span) {
+  if (span.end <= span.start) return span;
+  const start = clamp(Math.round(index), span.start, span.end - 1);
+  return { start, end: start + 1 };
 }
 
 function groupSliceRunsByBridge(runs, span) {
@@ -2180,11 +2155,11 @@ function selectSliceRunGroup(groups, span) {
     .sort((a, b) => b.score - a.score)[0].group;
 }
 
-function drawableSpan(scan) {
+function drawableSpan(scan, drawable = scan.drawable) {
   let start = null;
   let end = null;
   for (let i = scan.validStart; i < scan.validEnd; i += 1) {
-    if (!scan.drawable[i]) continue;
+    if (!drawable[i]) continue;
     if (start === null) start = i;
     end = i + 1;
   }
@@ -2197,19 +2172,25 @@ function buildSliceScanTileRuns(areas, scans) {
     const scan = scans[side];
     const area = areas[side];
     if (!scan || !area) continue;
-    const horizontal = side === "top" || side === "bottom";
-    const areaStart = horizontal ? area.x : area.y;
-    const areaEnd = horizontal ? rectEndX(area) : rectEndY(area);
-    const minSize = Math.max(2, Math.round((areaEnd - areaStart) * 0.015));
-    const runs = scan.stableRuns
+    const axis = sideAxis(side);
+    const areaStart = rectPrimaryStart(area, axis);
+    const areaEnd = rectPrimaryEnd(area, axis);
+    const areaSize = Math.max(1, areaEnd - areaStart);
+    const minSize = Math.min(areaSize, Math.max(2, Math.round(areaSize * 0.015)));
+    let primaryRuns = scan.stableRuns
       .map((run) => ({
         start: clamp(run.start, areaStart, areaEnd),
         end: clamp(run.end, areaStart, areaEnd),
       }))
-      .filter((run) => run.end - run.start >= minSize)
-      .map((run) => horizontal
-        ? { x: run.start, y: area.y, w: run.end - run.start, h: area.h }
-        : { x: area.x, y: run.start, w: area.w, h: run.end - run.start });
+      .filter((run) => run.end - run.start >= minSize);
+    if (primaryRuns.length === 0) {
+      const fallback = bestFallbackSliceSupport(scan, { start: areaStart, end: areaEnd }, scan.supportDrawable || scan.drawable);
+      primaryRuns = [{
+        start: clamp(fallback.start, areaStart, areaEnd),
+        end: clamp(fallback.end, areaStart, areaEnd),
+      }].filter((run) => run.end > run.start);
+    }
+    const runs = primaryRuns.map((run) => rectFromPrimarySpan(area, axis, run.start, run.end));
     if (runs.length > 0) tileRuns[side] = runs;
   }
   return tileRuns;
@@ -2231,10 +2212,9 @@ function fixedRunsForTileGaps(area, tileRuns, axis) {
   if (!area || tileRuns.length < 2) return [];
   const areaStart = rectPrimaryStart(area, axis);
   const areaEnd = rectPrimaryEnd(area, axis);
-  const runs = tileRuns
+  const runs = mergeOverlappingPrimaryRuns(tileRuns
     .map((run) => rectIntersection(run, area))
-    .filter((run) => run && run.w > 0 && run.h > 0)
-    .sort((a, b) => rectPrimaryStart(a, axis) - rectPrimaryStart(b, axis));
+    .filter((run) => run && run.w > 0 && run.h > 0), axis);
   const gaps = [];
   for (let i = 0; i < runs.length - 1; i += 1) {
     const start = clamp(rectPrimaryEnd(runs[i], axis), areaStart, areaEnd);
@@ -2242,6 +2222,53 @@ function fixedRunsForTileGaps(area, tileRuns, axis) {
     if (end > start) gaps.push(rectFromPrimarySpan(area, axis, start, end));
   }
   return gaps;
+}
+
+function mergeOverlappingPrimaryRuns(runs, axis) {
+  const sorted = runs
+    .filter((rect) => rect && rect.w > 0 && rect.h > 0)
+    .map(cloneRect)
+    .sort((a, b) => rectPrimaryStart(a, axis) - rectPrimaryStart(b, axis));
+  if (sorted.length <= 1) return sorted;
+  const merged = [sorted[0]];
+  for (let i = 1; i < sorted.length; i += 1) {
+    const previous = merged[merged.length - 1];
+    const current = sorted[i];
+    if (rectPrimaryStart(current, axis) <= rectPrimaryEnd(previous, axis)) {
+      merged[merged.length - 1] = rectUnion(previous, current);
+    } else {
+      merged.push(current);
+    }
+  }
+  return merged;
+}
+
+function removeFixedRunTileOverlaps(fixedRuns, tileRuns, axis) {
+  const blockers = mergeOverlappingPrimaryRuns(tileRuns, axis);
+  if (blockers.length === 0) return fixedRuns;
+  const clipped = [];
+  for (const fixed of fixedRuns) {
+    let spans = [{ start: rectPrimaryStart(fixed, axis), end: rectPrimaryEnd(fixed, axis) }];
+    for (const blocker of blockers) {
+      const blockStart = rectPrimaryStart(blocker, axis);
+      const blockEnd = rectPrimaryEnd(blocker, axis);
+      spans = spans.flatMap((span) => {
+        if (blockEnd <= span.start || blockStart >= span.end) return [span];
+        const pieces = [];
+        if (blockStart > span.start) pieces.push({ start: span.start, end: blockStart });
+        if (blockEnd < span.end) pieces.push({ start: blockEnd, end: span.end });
+        return pieces;
+      });
+      if (spans.length === 0) break;
+    }
+    for (const span of spans) {
+      if (span.end <= span.start) continue;
+      clipped.push(axis === "x"
+        ? { x: span.start, y: fixed.y, w: span.end - span.start, h: fixed.h }
+        : { x: fixed.x, y: span.start, w: fixed.w, h: span.end - span.start });
+    }
+  }
+  return clipped;
 }
 
 function representativeFixedMedallions(fixedRuns, areas) {
@@ -2322,113 +2349,8 @@ function sideCrossThickness(frame, center, side) {
   return Math.max(0, frame.w - rectEndX(center));
 }
 
-function suggestPatch(frame, mode = state.autoMode) {
-  if (mode === "repeatScan") {
-    return suggestRepeatScanPatch(frame) || suggestSliceScanPatch(frame) || suggestStablePatch(frame) || suggestProjectionPatch(frame);
-  }
-  if (mode === "sliceScan") {
-    return suggestSliceScanPatch(frame) || suggestStablePatch(frame) || suggestProjectionPatch(frame);
-  }
-  if (mode === "projection") return suggestProjectionPatch(frame);
-  if (mode === "cornerSafeExpanded") {
-    return suggestCornerSafeExpandedPatch(frame) ||
-      suggestCornerSafePatch(frame) ||
-      suggestCompactPatch(frame) ||
-      suggestStablePatch(frame) ||
-      suggestProjectionPatch(frame);
-  }
-  if (mode === "cornerSafe") {
-    return suggestCornerSafePatch(frame) || suggestCompactPatch(frame) || suggestStablePatch(frame) || suggestProjectionPatch(frame);
-  }
-  if (mode === "compact") {
-    return suggestCompactPatch(frame) || suggestStablePatch(frame) || suggestProjectionPatch(frame);
-  }
-  return suggestStablePatch(frame) || suggestProjectionPatch(frame);
-}
-
-function suggestStablePatch(frame) {
-  const v = suggestStableAxisGuides(frame, "x");
-  const h = suggestStableAxisGuides(frame, "y");
-  if (!v || !h) return null;
-  return constrainPatch(frame, { v, h, mode: "tile" });
-}
-
-function suggestCompactPatch(frame) {
-  const v = suggestCompactColumns(frame);
-  const h = suggestCompactRows(frame);
-  if (!v || !h) return null;
-  return constrainPatch(frame, { v, h, mode: "tile" });
-}
-
-function suggestCornerSafePatch(frame) {
-  const v = suggestCornerSafeColumns(frame);
-  const h = suggestCornerSafeRows(frame);
-  if (!v || !h) return null;
-  return constrainPatch(frame, { v, h, mode: "tile" });
-}
-
-function suggestCornerSafeExpandedPatch(frame) {
-  const base = suggestCornerSafePatch(frame) || suggestCompactPatch(frame);
-  if (!base) return null;
-  const patch = clonePatch(base);
-  patch.v = expandGuidesBySimilarity(frame, "x", patch.v, patch.h);
-  patch.h = expandGuidesBySimilarity(frame, "y", patch.h, patch.v);
-  return constrainPatch(frame, patch);
-}
-
-function clonePatch(patch) {
-  return {
-    v: { ...patch.v },
-    h: { ...patch.h },
-    mode: patch.mode || "tile",
-  };
-}
-
-function suggestCornerSafeColumns(frame) {
-  const segments = findDenseProjectionSegments(frame, "x", true);
-  if (segments.length < 3) return null;
-  const mid = frame.w / 2;
-  const centerIndex = segments
-    .map((segment, index) => ({
-      index,
-      distance: Math.abs((segment.start + segment.end) / 2 - mid),
-    }))
-    .sort((a, b) => a.distance - b.distance)[0].index;
-  if (centerIndex <= 0 || centerIndex >= segments.length - 1) return null;
-
-  const left = segments[centerIndex - 1];
-  const right = segments[centerIndex + 1];
-  const railWidth = clamp(Math.round(frame.w * 0.012), 1, 2);
-  const leftGuide = left.end + 1;
-  const rightGuide = right.start - railWidth;
-
-  return {
-    left: leftGuide,
-    centerStart: leftGuide + railWidth,
-    centerEnd: rightGuide - railWidth,
-    right: rightGuide,
-  };
-}
-
-function suggestCornerSafeRows(frame) {
-  const segments = findDenseProjectionSegments(frame, "y", true);
-  if (segments.length < 2) return null;
-  const topSegment = segments[0];
-  const bottomSegment = segments[segments.length - 1];
-  const gap = bottomSegment.start - topSegment.end;
-  if (gap < Math.max(24, frame.h * 0.18)) return null;
-
-  const cornerClearance = clamp(Math.round(gap * 0.15), 8, 14);
-  const top = topSegment.end + cornerClearance;
-  const bottom = bottomSegment.start - cornerClearance;
-  const centerStart = Math.round(top + (bottom - top) * 0.56);
-
-  return {
-    top,
-    centerStart,
-    centerEnd: centerStart + 1,
-    bottom,
-  };
+function suggestPatch(frame) {
+  return suggestSliceScanPatch(frame);
 }
 
 function expandGuidesBySimilarity(frame, axis, guides, crossGuides) {
@@ -2555,297 +2477,8 @@ function makeAxisProfile(frame, axis, primary, crossRanges, width, data) {
   return profile;
 }
 
-function suggestCompactColumns(frame) {
-  const segments = findDenseProjectionSegments(frame, "x");
-  if (segments.length < 3) return null;
-  const mid = frame.w / 2;
-  const centerIndex = segments
-    .map((segment, index) => ({
-      index,
-      distance: Math.abs((segment.start + segment.end) / 2 - mid),
-    }))
-    .sort((a, b) => a.distance - b.distance)[0].index;
-  if (centerIndex <= 0 || centerIndex >= segments.length - 1) return null;
-
-  const left = segments[centerIndex - 1];
-  const center = segments[centerIndex];
-  const right = segments[centerIndex + 1];
-  const leftGap = Math.max(1, center.start - left.end);
-  const rightGap = Math.max(1, right.start - center.end);
-  const leftRail = clamp(Math.round(leftGap * 0.22), 2, 4);
-  const rightRail = clamp(Math.round(rightGap * 0.3), 2, 4);
-
-  return {
-    left: left.end - 1,
-    centerStart: left.end + leftRail,
-    centerEnd: right.start - rightRail,
-    right: right.start - 1,
-  };
-}
-
-function suggestCompactRows(frame) {
-  const segments = findDenseProjectionSegments(frame, "y");
-  if (segments.length < 2) return null;
-  const topSegment = segments[0];
-  const bottomSegment = segments[segments.length - 1];
-  if (bottomSegment.start <= topSegment.end) return null;
-
-  const gap = bottomSegment.start - topSegment.end;
-  const top = topSegment.end + 2;
-  const bottom = bottomSegment.start - clamp(Math.round(gap * 0.07), 3, 6);
-  const centerStart = Math.round(top + (bottom - top) * 0.57);
-
-  return {
-    top,
-    centerStart,
-    centerEnd: centerStart + clamp(Math.round(frame.h * 0.006), 1, 2),
-    bottom,
-  };
-}
-
-function findDenseProjectionSegments(frame, axis, useGuideAlpha = false) {
-  const alphaThreshold = Number(els.alphaThreshold.value);
-  const length = axis === "x" ? frame.w : frame.h;
-  const cross = axis === "x" ? frame.h : frame.w;
-  const counts = new Array(length).fill(0);
-  const width = useGuideAlpha ? state.originalData.width : state.keyedData.width;
-  const data = useGuideAlpha ? state.originalData.data : state.keyedData.data;
-
-  for (let primary = 0; primary < length; primary += 1) {
-    let count = 0;
-    for (let secondary = 0; secondary < cross; secondary += 1) {
-      const x = axis === "x" ? frame.x + primary : frame.x + secondary;
-      const y = axis === "x" ? frame.y + secondary : frame.y + primary;
-      const index = (y * width + x) * 4;
-      const alpha = useGuideAlpha
-        ? guideAlphaAt(index, data)
-        : data[index + 3];
-      if (alpha > alphaThreshold) count += 1;
-    }
-    counts[primary] = count;
-  }
-
-  const maxCount = Math.max(...counts, 1);
-  const threshold = Math.max(8, maxCount * 0.19);
-  const minLength = Math.max(4, Math.round(length * 0.018));
-  const segments = [];
-  let start = null;
-  for (let i = 0; i < counts.length; i += 1) {
-    const dense = counts[i] >= threshold;
-    if (dense && start === null) start = i;
-    if ((!dense || i === counts.length - 1) && start !== null) {
-      const end = dense ? i + 1 : i;
-      if (end - start >= minLength) {
-        segments.push({ start, end, peak: Math.max(...counts.slice(start, end)) });
-      }
-      start = null;
-    }
-  }
-  return segments;
-}
-
-function suggestStableAxisGuides(frame, axis) {
-  const length = axis === "x" ? frame.w : frame.h;
-  const segments = findStableRailSegments(frame, axis);
-  const mid = length / 2;
-  const startTrim = axis === "x"
-    ? clamp(Math.round(length * 0.006), 1, 4)
-    : 2;
-  const innerTrim = axis === "x"
-    ? clamp(Math.round(length * 0.010), 1, 3)
-    : 1;
-  const endTrim = axis === "x"
-    ? clamp(Math.round(length * 0.024), 2, 8)
-    : 1;
-
-  const spanning = segments
-    .filter((segment) => segment.start < mid && segment.end > mid && segment.end - segment.start > length * 0.16)
-    .sort((a, b) => (b.end - b.start) - (a.end - a.start))[0];
-  if (spanning) {
-    const first = spanning.start + startTrim;
-    const last = spanning.end - endTrim;
-    const center = Math.floor((first + last) / 2);
-    return axis === "x"
-      ? {
-          left: first,
-          centerStart: center - 1,
-          centerEnd: center + 1,
-          right: last,
-        }
-      : {
-          top: first,
-          centerStart: center - 1,
-          centerEnd: center + 1,
-          bottom: last,
-        };
-  }
-
-  const leftSegments = segments.filter((segment) => (segment.start + segment.end) / 2 < mid);
-  const rightSegments = segments.filter((segment) => (segment.start + segment.end) / 2 > mid);
-  if (leftSegments.length === 0 || rightSegments.length === 0) return null;
-
-  const before = leftSegments.sort((a, b) => b.end - a.end)[0];
-  const after = rightSegments.sort((a, b) => a.start - b.start)[0];
-  const first = before.start + startTrim;
-  const second = before.end - innerTrim;
-  const third = after.start - (axis === "x" ? 1 : 0);
-  const fourth = after.end - endTrim;
-
-  return axis === "x"
-    ? {
-        left: first,
-        centerStart: second,
-        centerEnd: third,
-        right: fourth,
-      }
-    : {
-        top: first,
-        centerStart: second,
-        centerEnd: third,
-        bottom: fourth,
-      };
-}
-
-function findStableRailSegments(frame, axis) {
-  const alphaThreshold = Number(els.alphaThreshold.value);
-  const length = axis === "x" ? frame.w : frame.h;
-  const cross = axis === "x" ? frame.h : frame.w;
-  const edge = Math.max(1, Math.min(Math.round(cross * 0.32), Math.floor(cross / 2)));
-  const threshold = axis === "x" ? 2.6 : 1.6;
-  const mass = new Array(length).fill(0);
-  const diff = new Array(length).fill(Number.POSITIVE_INFINITY);
-  const width = state.originalData.width;
-  const data = state.originalData.data;
-
-  for (let i = 0; i < length; i += 1) {
-    let coordinateMass = 0;
-    for (let j = 0; j < edge; j += 1) {
-      const a = sampleGuideAlpha(frame, axis, i, j, width, data);
-      const b = sampleGuideAlpha(frame, axis, i, cross - edge + j, width, data);
-      if (a > alphaThreshold) coordinateMass += 1;
-      if (b > alphaThreshold) coordinateMass += 1;
-    }
-    mass[i] = coordinateMass;
-  }
-
-  for (let i = 1; i < length; i += 1) {
-    let total = 0;
-    for (let j = 0; j < edge; j += 1) {
-      total += premultipliedGuidePixelDiff(frame, axis, i, i - 1, j, width, data);
-      total += premultipliedGuidePixelDiff(frame, axis, i, i - 1, cross - edge + j, width, data);
-    }
-    diff[i] = total / 255;
-  }
-
-  const positiveMass = mass.filter((value) => value > 0).sort((a, b) => a - b);
-  const massFloor = Math.max(4, positiveMass[Math.floor(positiveMass.length * 0.05)] || 4);
-  const low = diff.map((value, i) => value <= threshold && mass[i] >= massFloor);
-  const segments = [];
-  const minLength = Math.max(4, Math.round(length * 0.018));
-  const guard = Math.max(3, Math.round(length * 0.04));
-  let start = null;
-  for (let i = 0; i < low.length; i += 1) {
-    if (low[i] && start === null) start = i;
-    if ((!low[i] || i === low.length - 1) && start !== null) {
-      const end = low[i] ? i + 1 : i;
-      if (end - start >= minLength && end > guard && start < length - guard) {
-        segments.push({
-          start,
-          end,
-          score: diff.slice(start, end).reduce((sum, value) => sum + value, 0) / (end - start),
-        });
-      }
-      start = null;
-    }
-  }
-  return segments;
-}
-
-function sampleGuideAlpha(frame, axis, primary, secondary, width, data) {
-  const x = axis === "x" ? frame.x + primary : frame.x + secondary;
-  const y = axis === "x" ? frame.y + secondary : frame.y + primary;
-  return guideAlphaAt((y * width + x) * 4, data);
-}
-
-function premultipliedGuidePixelDiff(frame, axis, aPrimary, bPrimary, secondary, width, data) {
-  const ax = axis === "x" ? frame.x + aPrimary : frame.x + secondary;
-  const ay = axis === "x" ? frame.y + secondary : frame.y + aPrimary;
-  const bx = axis === "x" ? frame.x + bPrimary : frame.x + secondary;
-  const by = axis === "x" ? frame.y + secondary : frame.y + bPrimary;
-  const ai = (ay * width + ax) * 4;
-  const bi = (by * width + bx) * 4;
-  const aAlpha = guideAlphaAt(ai, data);
-  const bAlpha = guideAlphaAt(bi, data);
-  const aa = aAlpha / 255;
-  const ba = bAlpha / 255;
-  return (
-    Math.abs(data[ai] * aa - data[bi] * ba) +
-    Math.abs(data[ai + 1] * aa - data[bi + 1] * ba) +
-    Math.abs(data[ai + 2] * aa - data[bi + 2] * ba) +
-    Math.abs(aAlpha - bAlpha)
-  );
-}
-
 function guideAlphaAt(index, data) {
   return data[index + 3];
-}
-
-function suggestProjectionPatch(frame) {
-  const alpha = state.keyedData.data;
-  const width = state.keyedData.width;
-  const xCounts = new Array(frame.w).fill(0);
-  const yCounts = new Array(frame.h).fill(0);
-  for (let y = 0; y < frame.h; y += 1) {
-    for (let x = 0; x < frame.w; x += 1) {
-      const a = alpha[((frame.y + y) * width + frame.x + x) * 4 + 3];
-      if (a > 30) {
-        xCounts[x] += 1;
-        yCounts[y] += 1;
-      }
-    }
-  }
-
-  const left = suggestEdgeCut(xCounts, 0, frame.w);
-  const rightInset = suggestEdgeCut([...xCounts].reverse(), 0, frame.w);
-  const top = suggestEdgeCut(yCounts, 0, frame.h);
-  const bottomInset = suggestEdgeCut([...yCounts].reverse(), 0, frame.h);
-  const right = clamp(frame.w - rightInset, left + 4, frame.w - 1);
-  const bottom = clamp(frame.h - bottomInset, top + 4, frame.h - 1);
-
-  const centerX = suggestCenterBand(projectTopBottom(frame, top, bottom), frame.w, left, right);
-  const centerY = suggestCenterBand(projectLeftRight(frame, left, right), frame.h, top, bottom);
-
-  return constrainPatch(frame, {
-    v: {
-      left,
-      centerStart: centerX.start,
-      centerEnd: centerX.end,
-      right,
-    },
-    h: {
-      top,
-      centerStart: centerY.start,
-      centerEnd: centerY.end,
-      bottom,
-    },
-    mode: "tile",
-  });
-}
-
-function suggestEdgeCut(counts, min, length) {
-  const limit = Math.max(8, Math.floor(length * 0.34));
-  const smooth = smoothCounts(counts, 5);
-  const max = Math.max(...smooth.slice(0, limit));
-  const threshold = Math.max(2, max * 0.22);
-  let started = false;
-  let quiet = 0;
-  for (let i = 0; i < limit; i += 1) {
-    if (smooth[i] > threshold) started = true;
-    if (started && smooth[i] <= threshold) quiet += 1;
-    else quiet = 0;
-    if (quiet >= 3) return clamp(i - 1, 4, limit);
-  }
-  return clamp(Math.round(length * 0.14), 4, limit);
 }
 
 function smoothCounts(counts, radius) {
@@ -2858,69 +2491,6 @@ function smoothCounts(counts, radius) {
     }
     return sum / n;
   });
-}
-
-function projectTopBottom(frame, top, bottom) {
-  const counts = new Array(frame.w).fill(0);
-  const data = state.keyedData.data;
-  const width = state.keyedData.width;
-  for (let y = 0; y < frame.h; y += 1) {
-    if (!(y <= top || y >= bottom)) continue;
-    for (let x = 0; x < frame.w; x += 1) {
-      if (data[((frame.y + y) * width + frame.x + x) * 4 + 3] > 30) counts[x] += 1;
-    }
-  }
-  return counts;
-}
-
-function projectLeftRight(frame, left, right) {
-  const counts = new Array(frame.h).fill(0);
-  const data = state.keyedData.data;
-  const width = state.keyedData.width;
-  for (let y = 0; y < frame.h; y += 1) {
-    for (let x = 0; x < frame.w; x += 1) {
-      if (!(x <= left || x >= right)) continue;
-      if (data[((frame.y + y) * width + frame.x + x) * 4 + 3] > 30) counts[y] += 1;
-    }
-  }
-  return counts;
-}
-
-function suggestCenterBand(counts, length, lowGuard, highGuard) {
-  const smooth = smoothCounts(counts, 4);
-  const middle = Math.floor(length / 2);
-  const innerStart = clamp(lowGuard + 4, 0, length - 1);
-  const innerEnd = clamp(highGuard - 4, innerStart + 1, length - 1);
-  const inner = smooth.slice(innerStart, innerEnd);
-  const sorted = [...inner].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)] || 0;
-  const max = Math.max(...inner, 1);
-  const threshold = Math.max(median * 1.7, median + 3, max * 0.36);
-
-  let best = null;
-  let runStart = null;
-  for (let i = innerStart; i <= innerEnd; i += 1) {
-    if (smooth[i] >= threshold) {
-      if (runStart === null) runStart = i;
-    } else if (runStart !== null) {
-      best = chooseCenterRun(best, { start: runStart, end: i }, middle);
-      runStart = null;
-    }
-  }
-  if (runStart !== null) best = chooseCenterRun(best, { start: runStart, end: innerEnd }, middle);
-
-  if (!best || best.end - best.start < 4) {
-    const size = clamp(Math.round(length * 0.12), 8, Math.max(8, Math.floor(length * 0.24)));
-    return {
-      start: clamp(Math.round(length / 2 - size / 2), lowGuard + 2, highGuard - size - 2),
-      end: clamp(Math.round(length / 2 + size / 2), lowGuard + size + 2, highGuard - 2),
-    };
-  }
-
-  return {
-    start: clamp(best.start - 4, lowGuard + 1, highGuard - 3),
-    end: clamp(best.end + 4, lowGuard + 3, highGuard - 1),
-  };
 }
 
 function chooseCenterRun(best, candidate, middle) {
@@ -3027,29 +2597,37 @@ function drawEditor() {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
   if (!frame || !areas) {
+    setCanvasSourceSize(els.editorCanvas, 1, 1);
     resizeCanvasBitmap(els.editorCanvas, 1, 1);
-    setCanvasDisplayScale(els.editorCanvas, 1, 1, 2);
+    setCanvasDisplayScale(els.editorCanvas, 1, 1, state.editorZoom);
     editorCtx.clearRect(0, 0, 1, 1);
     els.areaStats.textContent = "";
     els.selectionStats.textContent = "No frame selected.";
     return;
   }
 
-  resizeCanvasBitmap(els.editorCanvas, frame.w, frame.h);
-  setCanvasDisplayScale(els.editorCanvas, frame.w, frame.h, 2);
+  setCanvasSourceSize(els.editorCanvas, frame.w, frame.h);
+  resizeCanvasBitmap(
+    els.editorCanvas,
+    Math.max(1, Math.round(frame.w * state.editorZoom)),
+    Math.max(1, Math.round(frame.h * state.editorZoom)),
+  );
+  setCanvasDisplayScale(els.editorCanvas, frame.w, frame.h, state.editorZoom);
+  editorCtx.setTransform(1, 0, 0, 1, 0, 0);
+  editorCtx.clearRect(0, 0, els.editorCanvas.width, els.editorCanvas.height);
+  editorCtx.imageSmoothingEnabled = false;
+  editorCtx.save();
+  editorCtx.scale(els.editorCanvas.width / frame.w, els.editorCanvas.height / frame.h);
   drawChecker(editorCtx, frame.w, frame.h, 10);
   editorCtx.drawImage(getRenderCanvas(), frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
 
   editorCtx.save();
-  editorCtx.lineWidth = Math.max(1, Math.ceil(Math.max(frame.w, frame.h) / 380));
+  editorCtx.lineWidth = onePixelLine(editorCtx);
   drawAreaRect(editorCtx, areas.center, "#d1a943", [8, 5], "center");
-  drawEdgeAreaRect(editorCtx, areas, "top", "#67a8ff");
-  drawEdgeAreaRect(editorCtx, areas, "bottom", "#67a8ff");
-  drawEdgeAreaRect(editorCtx, areas, "left", "#83bd6b");
-  drawEdgeAreaRect(editorCtx, areas, "right", "#83bd6b");
   drawTileRuns(editorCtx, areas.tileRuns || {});
   drawFixedRuns(editorCtx, areas.fixedRuns || {}, areas.medallions || {});
   drawSelectedSliceOutline(editorCtx);
+  editorCtx.restore();
   editorCtx.restore();
 
   const insets = getEdgeInsets(frame, areas);
@@ -3073,11 +2651,6 @@ function drawEditor() {
 
 function sideHasTileRuns(areas, side) {
   return (areas.tileRuns?.[side] || []).length > 0;
-}
-
-function drawEdgeAreaRect(ctx, areas, side, color) {
-  if (sideHasTileRuns(areas, side)) return;
-  drawAreaRect(ctx, areas[side], color, [], side);
 }
 
 function drawAreaRect(ctx, rect, color, dash, label) {
@@ -3112,15 +2685,30 @@ function drawAreaResizeHandles(ctx, rect, label) {
 
 function drawTileRuns(ctx, tileRuns) {
   ctx.save();
-  ctx.lineWidth = 1;
+  ctx.lineWidth = onePixelLine(ctx);
   ctx.strokeStyle = "#d1a943";
   ctx.fillStyle = "rgba(209, 169, 67, 0.14)";
   ctx.setLineDash([3, 3]);
   for (const [side, runs] of Object.entries(tileRuns || {})) {
     runs.forEach((rect, index) => {
-      drawEditableRunRect(ctx, side, rect, `${side} slice ${index + 1}`);
+      drawEditableRunRect(ctx, side, rect, `${side} slice ${index + 1}`, false);
     });
   }
+  ctx.restore();
+}
+
+function drawOverlayLabel(ctx, rect, label, color) {
+  ctx.save();
+  ctx.setLineDash([]);
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.textBaseline = "top";
+  const x = clamp(rect.x + 3, 0, Math.max(0, canvasSourceWidth(ctx.canvas) - 8));
+  const y = clamp(rect.y + 3, 0, Math.max(0, canvasSourceHeight(ctx.canvas) - 12));
+  ctx.lineWidth = onePixelLine(ctx) * 3;
+  ctx.strokeStyle = "rgba(12, 15, 10, 0.85)";
+  ctx.strokeText(label, x, y);
+  ctx.fillStyle = color;
+  ctx.fillText(label, x, y);
   ctx.restore();
 }
 
@@ -3130,12 +2718,10 @@ function drawSelectedSliceOutline(ctx) {
   const rect = selected.rect;
   ctx.save();
   ctx.setLineDash([]);
-  ctx.lineWidth = 3;
+  ctx.lineWidth = onePixelLine(ctx);
   ctx.strokeStyle = "#eef2e4";
-  ctx.strokeRect(rect.x - 1.5, rect.y - 1.5, rect.w + 3, rect.h + 3);
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = "#10130e";
   ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, Math.max(0, rect.w - 1), Math.max(0, rect.h - 1));
+  if (selected.kind === "slice") drawRectEdgeHandles(ctx, rect);
   ctx.restore();
 }
 
@@ -3143,14 +2729,14 @@ function drawFixedRuns(ctx, fixedRuns, medallions) {
   const hasFixedRuns = Object.values(fixedRuns).some((runs) => runs.length > 0);
   if (hasFixedRuns) {
     ctx.save();
-    ctx.lineWidth = 1;
+    ctx.lineWidth = onePixelLine(ctx);
     ctx.strokeStyle = "#ff6d6d";
     ctx.fillStyle = "rgba(255, 109, 109, 0.13)";
     ctx.setLineDash([4, 3]);
     for (const [side, runs] of Object.entries(fixedRuns)) {
       runs.forEach((rect, index) => {
         const label = runs.length === 1 ? `${side} medallion` : `${side} medallion ${index + 1}`;
-        drawEditableRunRect(ctx, side, rect, label, true, "#ffb1b1");
+        drawEditableRunRect(ctx, side, rect, label, false, "#ffb1b1");
       });
     }
     ctx.restore();
@@ -3185,14 +2771,25 @@ function drawEditableRunResizeHandles(ctx, side, rect) {
   ctx.setLineDash(previousDash);
 }
 
+function drawRectEdgeHandles(ctx, rect) {
+  ctx.save();
+  ctx.fillStyle = "#eef2e4";
+  ctx.strokeStyle = "#10130e";
+  for (const handle of getRectEdgeHandlePoints(rect)) {
+    ctx.fillRect(handle.x - 3, handle.y - 3, 7, 7);
+    ctx.strokeRect(handle.x - 3.5, handle.y - 3.5, 8, 8);
+  }
+  ctx.restore();
+}
+
 function drawMedallions(ctx, medallions) {
   ctx.save();
-  ctx.lineWidth = 1;
+  ctx.lineWidth = onePixelLine(ctx);
   ctx.strokeStyle = "#ff6d6d";
   ctx.fillStyle = "rgba(255, 109, 109, 0.13)";
   ctx.setLineDash([4, 3]);
   for (const [side, rect] of Object.entries(medallions || {})) {
-    drawEditableRunRect(ctx, side, rect, `${side} medallion`, true, "#ffb1b1");
+    drawEditableRunRect(ctx, side, rect, `${side} medallion`, false, "#ffb1b1");
   }
   ctx.restore();
 }
@@ -3209,6 +2806,17 @@ function getAreaHandlePoints(side, rect) {
   return [
     { handle: "start", x, y: rect.y },
     { handle: "end", x, y: rect.y + rect.h },
+  ];
+}
+
+function getRectEdgeHandlePoints(rect) {
+  const midX = rect.x + rect.w / 2;
+  const midY = rect.y + rect.h / 2;
+  return [
+    { handle: "left", x: rect.x, y: midY },
+    { handle: "right", x: rect.x + rect.w, y: midY },
+    { handle: "top", x: midX, y: rect.y },
+    { handle: "bottom", x: midX, y: rect.y + rect.h },
   ];
 }
 
@@ -3651,9 +3259,9 @@ function drawEdgeArea(ctx, frame, area, dest, axis, mode, tileRuns = []) {
   if (mode === "stretch") {
     ctx.drawImage(getRenderCanvas(), src.x, src.y, src.w, src.h, dest.x, dest.y, dest.w, dest.h);
   } else if (tileRuns.length > 0) {
-    drawTiledEdgeRuns(ctx, frame, tileRuns, dest, axis, mode === "mirror");
+    drawTiledEdgeRuns(ctx, frame, tileRuns, dest, axis, mode === "mirror", mode === "tile_stretch");
   } else {
-    drawTiledRegion(ctx, src, dest, axis === "x", axis === "y", mode === "mirror");
+    drawTiledRegion(ctx, src, dest, axis === "x", axis === "y", mode === "mirror", mode === "tile_stretch");
   }
 }
 
@@ -3699,9 +3307,89 @@ function mergeFixedRunsForArea(runs, axis) {
   return merged;
 }
 
-function drawTiledEdgeRuns(ctx, frame, runs, dest, axis, mirror) {
+function runPrimarySize(run, horizontal) {
+  return horizontal ? run.w : run.h;
+}
+
+function repeatedRunSourceSize(runs, count, horizontal) {
+  const cycleSize = runs.reduce((sum, run) => sum + runPrimarySize(run, horizontal), 0);
+  const fullCycles = Math.floor(count / runs.length);
+  let total = cycleSize * fullCycles;
+  for (let i = 0; i < count % runs.length; i += 1) {
+    total += runPrimarySize(runs[i], horizontal);
+  }
+  return total;
+}
+
+function chooseTileStretchCount(destSize, tileSize) {
+  if (destSize <= 0 || tileSize <= 0) return 1;
+  return Math.max(1, Math.round(destSize / tileSize));
+}
+
+function chooseTileStretchRunCount(runs, destSize, horizontal) {
+  const cycleSize = runs.reduce((sum, run) => sum + runPrimarySize(run, horizontal), 0);
+  if (destSize <= 0 || cycleSize <= 0) return 1;
+  const averageSize = cycleSize / runs.length;
+  const estimate = Math.max(1, Math.round(destSize / averageSize));
+  const start = Math.max(1, estimate - runs.length - 2);
+  const end = Math.max(start, estimate + runs.length + 2);
+  let bestCount = start;
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (let count = start; count <= end; count += 1) {
+    const sourceSize = repeatedRunSourceSize(runs, count, horizontal);
+    const diff = Math.abs(sourceSize - destSize);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestCount = count;
+    }
+  }
+  return bestCount;
+}
+
+function drawTileStretchEdgeRuns(ctx, frame, runs, dest, axis) {
   const validRuns = runs.filter((run) => run.w > 0 && run.h > 0);
   if (validRuns.length === 0 || dest.w <= 0 || dest.h <= 0) return;
+  const horizontal = axis === "x";
+  const destStart = horizontal ? dest.x : dest.y;
+  const destSize = horizontal ? dest.w : dest.h;
+  const count = chooseTileStretchRunCount(validRuns, destSize, horizontal);
+  const sourceSize = repeatedRunSourceSize(validRuns, count, horizontal);
+  if (sourceSize <= 0) return;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(dest.x, dest.y, dest.w, dest.h);
+  ctx.clip();
+
+  const scale = destSize / sourceSize;
+  const destEnd = destStart + destSize;
+  let position = destStart;
+  for (let tileIndex = 0; tileIndex < count; tileIndex += 1) {
+    const run = validRuns[tileIndex % validRuns.length];
+    const step = runPrimarySize(run, horizontal);
+    const drawSize = tileIndex === count - 1 ? destEnd - position : step * scale;
+    const source = {
+      x: frame.x + run.x,
+      y: frame.y + run.y,
+      w: run.w,
+      h: run.h,
+    };
+    const draw = horizontal
+      ? { x: position, y: dest.y, w: drawSize, h: dest.h }
+      : { x: dest.x, y: position, w: dest.w, h: drawSize };
+    ctx.drawImage(getRenderCanvas(), source.x, source.y, source.w, source.h, draw.x, draw.y, draw.w, draw.h);
+    position += drawSize;
+  }
+  ctx.restore();
+}
+
+function drawTiledEdgeRuns(ctx, frame, runs, dest, axis, mirror, stretchTiles = false) {
+  const validRuns = runs.filter((run) => run.w > 0 && run.h > 0);
+  if (validRuns.length === 0 || dest.w <= 0 || dest.h <= 0) return;
+  if (stretchTiles) {
+    drawTileStretchEdgeRuns(ctx, frame, validRuns, dest, axis);
+    return;
+  }
   ctx.save();
   ctx.beginPath();
   ctx.rect(dest.x, dest.y, dest.w, dest.h);
@@ -3881,7 +3569,7 @@ function renderTwentyFivePatch(ctx, frame, patch, dw, dh, mode, variant = "full"
       if (mode === "stretch" || (!horizontalRail && !verticalRail)) {
         ctx.drawImage(getRenderCanvas(), src.x, src.y, src.w, src.h, dst.x, dst.y, dst.w, dst.h);
       } else {
-        drawTiledRegion(ctx, src, dst, horizontalRail, verticalRail, mode === "mirror");
+        drawTiledRegion(ctx, src, dst, horizontalRail, verticalRail, mode === "mirror", mode === "tile_stretch");
       }
     }
   }
@@ -3914,7 +3602,37 @@ function renderNinePatch(ctx, frame, patch, dw, dh) {
   }
 }
 
-function drawTiledRegion(ctx, src, dst, tileX, tileY, mirror) {
+function drawTileStretchRegion(ctx, src, dst, tileX, tileY) {
+  if (src.w <= 0 || src.h <= 0 || dst.w <= 0 || dst.h <= 0) return;
+  if (!tileX && !tileY) {
+    ctx.drawImage(getRenderCanvas(), src.x, src.y, src.w, src.h, dst.x, dst.y, dst.w, dst.h);
+    return;
+  }
+  const countX = tileX ? chooseTileStretchCount(dst.w, src.w) : 1;
+  const countY = tileY ? chooseTileStretchCount(dst.h, src.h) : 1;
+  const tileW = tileX ? dst.w / countX : dst.w;
+  const tileH = tileY ? dst.h / countY : dst.h;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(dst.x, dst.y, dst.w, dst.h);
+  ctx.clip();
+  for (let row = 0; row < countY; row += 1) {
+    for (let col = 0; col < countX; col += 1) {
+      const x = dst.x + col * tileW;
+      const y = dst.y + row * tileH;
+      const w = col === countX - 1 ? dst.x + dst.w - x : tileW;
+      const h = row === countY - 1 ? dst.y + dst.h - y : tileH;
+      ctx.drawImage(getRenderCanvas(), src.x, src.y, src.w, src.h, x, y, w, h);
+    }
+  }
+  ctx.restore();
+}
+
+function drawTiledRegion(ctx, src, dst, tileX, tileY, mirror, stretchTiles = false) {
+  if (stretchTiles) {
+    drawTileStretchRegion(ctx, src, dst, tileX, tileY);
+    return;
+  }
   ctx.save();
   ctx.beginPath();
   ctx.rect(dst.x, dst.y, dst.w, dst.h);
@@ -3954,9 +3672,48 @@ function resizeCanvasBitmap(canvas, width, height) {
   if (canvas.height !== height) canvas.height = height;
 }
 
+function setCanvasSourceSize(canvas, width, height) {
+  canvas.dataset.sourceWidth = String(Math.max(1, Math.round(width)));
+  canvas.dataset.sourceHeight = String(Math.max(1, Math.round(height)));
+}
+
+function canvasSourceWidth(canvas) {
+  return Number(canvas.dataset.sourceWidth) || canvas.width;
+}
+
+function canvasSourceHeight(canvas) {
+  return Number(canvas.dataset.sourceHeight) || canvas.height;
+}
+
 function setCanvasDisplayScale(canvas, width, height, scale) {
   canvas.style.width = `${Math.max(1, width * scale)}px`;
   canvas.style.height = `${Math.max(1, height * scale)}px`;
+}
+
+function onePixelLine(ctx) {
+  const transform = ctx.getTransform();
+  const scale = Math.max(Math.abs(transform.a) || 1, Math.abs(transform.d) || 1);
+  return 1 / scale;
+}
+
+function setEditorZoom(value, anchorEvent = null) {
+  const canvas = els.editorCanvas;
+  const wrap = canvas.closest(".editor-canvas-wrap");
+  const zoom = clamp(value, EDITOR_ZOOM_MIN, EDITOR_ZOOM_MAX);
+  if (!wrap || Math.abs(zoom - state.editorZoom) < 0.001) return;
+
+  const wrapRect = wrap.getBoundingClientRect();
+  const anchorX = anchorEvent ? anchorEvent.clientX - wrapRect.left : wrap.clientWidth / 2;
+  const anchorY = anchorEvent ? anchorEvent.clientY - wrapRect.top : wrap.clientHeight / 2;
+  const sourceX = (wrap.scrollLeft + anchorX) / state.editorZoom;
+  const sourceY = (wrap.scrollTop + anchorY) / state.editorZoom;
+
+  state.editorZoom = zoom;
+  drawEditor();
+  requestAnimationFrame(() => {
+    wrap.scrollLeft = sourceX * state.editorZoom - anchorX;
+    wrap.scrollTop = sourceY * state.editorZoom - anchorY;
+  });
 }
 
 function setProcessingStatus(message) {
@@ -4182,11 +3939,24 @@ function fittedCanvasRect(canvas) {
 
 function canvasPoint(event, canvas) {
   const rect = fittedCanvasRect(canvas);
+  const sourceWidth = canvasSourceWidth(canvas);
+  const sourceHeight = canvasSourceHeight(canvas);
   return {
-    x: clamp(Math.round((event.clientX - rect.x) * (canvas.width / rect.width)), 0, canvas.width),
-    y: clamp(Math.round((event.clientY - rect.y) * (canvas.height / rect.height)), 0, canvas.height),
+    x: clamp(Math.round((event.clientX - rect.x) * (sourceWidth / rect.width)), 0, sourceWidth),
+    y: clamp(Math.round((event.clientY - rect.y) * (sourceHeight / rect.height)), 0, sourceHeight),
     inside: event.clientX >= rect.x && event.clientX <= rect.x + rect.width && event.clientY >= rect.y && event.clientY <= rect.y + rect.height,
   };
+}
+
+function isFileDrag(dataTransfer) {
+  return Array.from(dataTransfer?.types || []).includes("Files");
+}
+
+function isWindowDragLeave(event) {
+  return event.clientX <= 0 ||
+    event.clientY <= 0 ||
+    event.clientX >= window.innerWidth ||
+    event.clientY >= window.innerHeight;
 }
 
 function dragRect(a, b) {
@@ -4263,6 +4033,33 @@ function pointInExpandedRect(point, rect, padding = 0) {
     point.y <= rect.y + rect.h + padding;
 }
 
+function findRectEdgeHandle(point, rect, threshold) {
+  const candidates = [
+    {
+      handle: "left",
+      distance: Math.abs(point.x - rect.x),
+      inSpan: point.y >= rect.y - threshold && point.y <= rect.y + rect.h + threshold,
+    },
+    {
+      handle: "right",
+      distance: Math.abs(point.x - rect.x - rect.w),
+      inSpan: point.y >= rect.y - threshold && point.y <= rect.y + rect.h + threshold,
+    },
+    {
+      handle: "top",
+      distance: Math.abs(point.y - rect.y),
+      inSpan: point.x >= rect.x - threshold && point.x <= rect.x + rect.w + threshold,
+    },
+    {
+      handle: "bottom",
+      distance: Math.abs(point.y - rect.y - rect.h),
+      inSpan: point.x >= rect.x - threshold && point.x <= rect.x + rect.w + threshold,
+    },
+  ].filter((candidate) => candidate.inSpan && candidate.distance <= threshold);
+  candidates.sort((a, b) => a.distance - b.distance);
+  return candidates[0]?.handle || null;
+}
+
 function findAreaSideAtPoint(point, areas) {
   const candidates = EDGE_SIDES
     .map((side) => ({ side, rect: areas[side] }))
@@ -4285,12 +4082,15 @@ function editableRunEntries(runsBySide) {
 
 function findEditableEntryHit(point, entries, kind, handleThreshold) {
   let bestHandle = null;
+  const edgeThreshold = Math.min(handleThreshold, 3);
   for (const entry of entries) {
-    for (const handle of getAreaHandlePoints(entry.side, entry.rect)) {
-      const distance = Math.hypot(point.x - handle.x, point.y - handle.y);
-      if (distance <= handleThreshold && (!bestHandle || distance < bestHandle.distance)) {
-        bestHandle = { ...entry, kind, handle: handle.handle, distance };
-      }
+    const handle = findRectEdgeHandle(point, entry.rect, edgeThreshold);
+    if (!handle) continue;
+    const distance = handle === "left" || handle === "right"
+      ? Math.abs(point.x - (handle === "left" ? entry.rect.x : entry.rect.x + entry.rect.w))
+      : Math.abs(point.y - (handle === "top" ? entry.rect.y : entry.rect.y + entry.rect.h));
+    if (!bestHandle || distance < bestHandle.distance) {
+      bestHandle = { ...entry, kind, handle, distance };
     }
   }
   if (bestHandle) {
@@ -4501,44 +4301,6 @@ function setExplicitFixedSide(areas, side, explicit) {
   if (Object.keys(areas.fixedRunsExplicitSides).length === 0) delete areas.fixedRunsExplicitSides;
 }
 
-function scanRepeatSide(side) {
-  const frame = getSelectedFrame();
-  const areas = getSelectedAreas();
-  if (!frame || !areas || !EDGE_SIDES.includes(side)) return;
-
-  const next = cloneAreas(areas);
-  const center = normalizeRect(frame, next.center || findTransparentCenterRect(frame), 1);
-  const scan = buildSideRepeatScan(frame, center, side);
-  const scans = state.repeatScans.get(frame.id) || {};
-  scans[side] = scan;
-  state.repeatScans.set(frame.id, scans);
-
-  if (!scan.period || scan.repeatableRuns.length < 2) {
-    setStatus(`${frame.name}: no repeat found on ${side}.`);
-    return;
-  }
-
-  next.center = center;
-  next[side] = sideAreaFromRepeatScan(frame, center, side, scan);
-  const tileRuns = repeatScanTileRunsForSide(next[side], scan, side);
-  if (tileRuns.length === 0) {
-    setStatus(`${frame.name}: repeat scan found no usable ${side} slices.`);
-    return;
-  }
-
-  const fixedRuns = repeatScanFixedRunsForSide(next[side], scan, tileRuns, side);
-  setRunCollectionSide(next, "tileRuns", side, tileRuns);
-  setRunCollectionSide(next, "fixedRuns", side, fixedRuns);
-  setExplicitFixedSide(next, side, fixedRuns.length > 0);
-  setMedallionForSide(next, side, fixedRuns);
-
-  state.edgeAreas.set(frame.id, constrainEdgeAreas(frame, next));
-  rememberFrameSettings(frame);
-  scheduleSaveCurrentImageState();
-  renderAll();
-  setStatus(`${frame.name}: ${side} repeat scan applied, period ${scan.period}px.`);
-}
-
 function addSliceAt(side, point) {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
@@ -4649,11 +4411,33 @@ function resizePrimaryRunRect(side, handle, point, sourceRect, bounds) {
   return clampRectInside(next, bounds);
 }
 
+function resizeRectEdge(sourceRect, handle, point, bounds) {
+  const next = cloneRect(sourceRect);
+  if (handle === "left") {
+    const end = rectEndX(sourceRect);
+    next.x = clamp(point.x, bounds.x, end - 1);
+    next.w = end - next.x;
+  } else if (handle === "right") {
+    const end = clamp(point.x, sourceRect.x + 1, rectEndX(bounds));
+    next.w = end - sourceRect.x;
+  } else if (handle === "top") {
+    const end = rectEndY(sourceRect);
+    next.y = clamp(point.y, bounds.y, end - 1);
+    next.h = end - next.y;
+  } else if (handle === "bottom") {
+    const end = clamp(point.y, sourceRect.y + 1, rectEndY(bounds));
+    next.h = end - sourceRect.y;
+  }
+  return clampRectInside(next, bounds);
+}
+
 function resizeEditableRun(drag, point) {
   const frame = getSelectedFrame();
   const areas = getSelectedAreas();
   if (!frame || !areas || !areas[drag.side]) return;
-  const next = resizePrimaryRunRect(drag.side, drag.handle, point, drag.rect, areas[drag.side]);
+  const next = ["left", "right", "top", "bottom"].includes(drag.handle)
+    ? resizeRectEdge(drag.rect, drag.handle, point, areas[drag.side])
+    : resizePrimaryRunRect(drag.side, drag.handle, point, drag.rect, areas[drag.side]);
   if (drag.kind === "slice") {
     setSliceRun(drag.side, drag.index, next);
   } else if (drag.kind === "medallion") {
@@ -4850,12 +4634,13 @@ function downloadAll() {
 
 function updateSliceScanControls() {
   updateControlLabels();
-  if (state.autoMode !== "sliceScan") return;
   const frame = getSelectedFrame();
   if (!frame) return;
-  const patch = suggestPatch(frame, "sliceScan");
+  const sideFlags = getAutoSideFlags();
+  const areas = suggestAutoEdgeAreas(frame, sideFlags);
+  const patch = suggestAutoPatch(frame, areas);
   if (patch) state.patches.set(frame.id, patch);
-  state.edgeAreas.set(frame.id, suggestEdgeAreas(frame, "sliceScan"));
+  if (areas) state.edgeAreas.set(frame.id, areas);
   renderAll();
 }
 
@@ -4908,7 +4693,6 @@ function showEditorContextMenu(event) {
   const sideLabel = context.side ? `${context.side} ` : "";
   const menu = els.editorContextMenu;
   menu.innerHTML = "";
-  addContextMenuButton(menu, `Scan ${sideLabel}repeats`, Boolean(context.side), () => scanRepeatSide(context.side));
   addContextMenuButton(menu, `Add ${sideLabel}slice`, Boolean(context.side), () => addSliceAt(context.side, context.point));
   addContextMenuButton(menu, `Add ${sideLabel}medallion`, Boolean(context.side), () => addMedallionAt(context.side, context.point));
   addContextMenuButton(menu, sliceLabel, Boolean(context.sliceHit), () => deleteSliceRun(context.sliceHit.side, context.sliceHit.index));
@@ -4925,10 +4709,8 @@ function showEditorContextMenu(event) {
 function installEvents() {
   els.imageSelect.addEventListener("change", () => loadImage(els.imageSelect.value, els.imageSelect.value));
   els.fileInput.addEventListener("change", () => {
-    const file = els.fileInput.files?.[0];
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    loadImage(url, file.name);
+    loadImageFiles(els.fileInput.files);
+    els.fileInput.value = "";
   });
   els.autoColorsBtn.addEventListener("click", () => {
     if (!state.originalData) return;
@@ -4972,6 +4754,12 @@ function installEvents() {
       scheduleSaveCurrentImageState();
     });
   });
+  els.autoSideInputs?.forEach((input) => {
+    input.addEventListener("change", () => {
+      rememberFrameSettings();
+      scheduleSaveCurrentImageState();
+    });
+  });
   els.detectBtn.addEventListener("click", detectFrames);
   els.sourceView.addEventListener("change", drawSource);
   els.manualFrameBtn.addEventListener("click", () => {
@@ -4981,9 +4769,11 @@ function installEvents() {
   els.autoGuidesBtn.addEventListener("click", () => {
     const frame = getSelectedFrame();
     if (!frame) return;
-    const patch = suggestPatch(frame, state.autoMode);
+    const sideFlags = getAutoSideFlags();
+    const areas = suggestAutoEdgeAreas(frame, sideFlags);
+    const patch = suggestAutoPatch(frame, areas);
     if (patch) state.patches.set(frame.id, patch);
-    state.edgeAreas.set(frame.id, suggestEdgeAreas(frame, state.autoMode));
+    if (areas) state.edgeAreas.set(frame.id, areas);
     rememberFrameSettings(frame);
     scheduleSaveCurrentImageState();
     renderAll();
@@ -5001,14 +4791,6 @@ function installEvents() {
       rememberFrameSettings();
       scheduleSaveCurrentImageState();
       renderPreviews();
-    });
-  });
-  document.querySelectorAll("[data-auto-mode]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.autoMode = normalizeAutoMode(button.dataset.autoMode);
-      document.querySelectorAll("[data-auto-mode]").forEach((b) => b.classList.toggle("active", b === button));
-      rememberFrameSettings();
-      scheduleSaveCurrentImageState();
     });
   });
   els.downloadAllBtn.addEventListener("click", downloadAll);
@@ -5112,6 +4894,15 @@ function installEvents() {
     state.areaDrag = null;
     flushPendingSave();
   });
+  els.editorCanvas.addEventListener("wheel", (event) => {
+    const point = canvasPoint(event, els.editorCanvas);
+    if (!point.inside) return;
+    event.preventDefault();
+    hideEditorContextMenu();
+    const direction = event.deltaY < 0 ? 1 : -1;
+    const factor = direction > 0 ? 1.18 : 1 / 1.18;
+    setEditorZoom(state.editorZoom * factor, event);
+  }, { passive: false });
   els.editorCanvas.addEventListener("contextmenu", showEditorContextMenu);
   document.addEventListener("pointerdown", (event) => {
     if (els.editorContextMenu?.hidden || els.editorContextMenu?.contains(event.target)) return;
@@ -5119,6 +4910,29 @@ function installEvents() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") hideEditorContextMenu();
+  });
+  window.addEventListener("dragenter", (event) => {
+    if (!isFileDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    windowFileDragDepth += 1;
+    document.body.classList.add("drag-over");
+  });
+  window.addEventListener("dragover", (event) => {
+    if (!isFileDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+  window.addEventListener("dragleave", (event) => {
+    if (!isFileDrag(event.dataTransfer)) return;
+    windowFileDragDepth = isWindowDragLeave(event) ? 0 : Math.max(0, windowFileDragDepth - 1);
+    if (windowFileDragDepth === 0) document.body.classList.remove("drag-over");
+  });
+  window.addEventListener("drop", (event) => {
+    if (!isFileDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    windowFileDragDepth = 0;
+    document.body.classList.remove("drag-over");
+    loadImageFiles(event.dataTransfer.files);
   });
   window.addEventListener("resize", hideEditorContextMenu);
   window.addEventListener("beforeunload", flushPendingSave);

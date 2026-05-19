@@ -26,6 +26,18 @@ body {
   font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
+body.drag-over::after {
+  content: "";
+  position: fixed;
+  inset: 8px;
+  z-index: 100;
+  pointer-events: none;
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  background: rgba(131, 189, 107, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(131, 189, 107, 0.35);
+}
+
 button,
 input,
 select {
@@ -188,6 +200,34 @@ h2 {
   display: grid;
   grid-template-columns: 1fr;
   gap: 10px;
+}
+
+.auto-side-options {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.check-field {
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  display: flex;
+  gap: 6px;
+  min-height: 32px;
+  padding: 5px 8px;
+}
+
+.check-field input {
+  accent-color: var(--accent);
+  min-height: 0;
+  padding: 0;
+  width: auto;
+}
+
+.check-field span {
+  display: block;
 }
 
 .file-button {
