@@ -1422,11 +1422,11 @@ function findInteriorTransparentBounds(frame) {
   return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
 }
 
-// Expand a medallion rect's CROSS extent (perpendicular to its edge) to the
-// gem's full opaque bounds within the side margin, keeping its along-span. The
-// detected medallion is otherwise clamped to the thin edge strip, which clips
-// the gem so it can't stick out past the border. Mirrors MultiPatchFrame._full_cross.
-function expandMedallionFullCross(frame, side, m, center) {
+// Expand a run/medallion rect's CROSS extent (perpendicular to its edge) to the
+// ornament's full opaque bounds within the side margin, keeping its along-span.
+// Detected fixed runs are clamped to the thin edge strip, which clips a gem so it
+// can't stick out past the border; the runtime draws what we export here.
+function expandRunFullCross(frame, side, m, center) {
   if (!state.keyedData || !center) return m;
   const horizontal = side === "top" || side === "bottom";
   const data = state.keyedData.data;
@@ -4734,10 +4734,10 @@ function serializePatch(frame) {
     transparentCenter: rectToArray(areas.center),
     backgroundRect: rectToArray(findInteriorTransparentBounds(frame)),
     areas: {
-      top: serializeEdgeSide(areas, "top", "x", mode),
-      bottom: serializeEdgeSide(areas, "bottom", "x", mode),
-      left: serializeEdgeSide(areas, "left", "y", mode),
-      right: serializeEdgeSide(areas, "right", "y", mode),
+      top: serializeEdgeSide(frame, areas, "top", "x", mode),
+      bottom: serializeEdgeSide(frame, areas, "bottom", "x", mode),
+      left: serializeEdgeSide(frame, areas, "left", "y", mode),
+      right: serializeEdgeSide(frame, areas, "right", "y", mode),
       corners: {
         topLeft: rectToArray(corners.topLeft),
         topRight: rectToArray(corners.topRight),
@@ -4745,7 +4745,7 @@ function serializePatch(frame) {
         bottomRight: rectToArray(corners.bottomRight),
       },
       medallions: Object.fromEntries(
-        Object.entries(areas.medallions || {}).map(([side, rect]) => [side, rectToArray(expandMedallionFullCross(frame, side, rect, areas.center))]),
+        Object.entries(areas.medallions || {}).map(([side, rect]) => [side, rectToArray(expandRunFullCross(frame, side, rect, areas.center))]),
       ),
     },
     colors: {
@@ -4783,11 +4783,14 @@ function serializePatch(frame) {
   };
 }
 
-function serializeEdgeSide(areas, side, axis, mode) {
+function serializeEdgeSide(frame, areas, side, axis, mode) {
   const data = { source: rectToArray(areas[side]), axis, mode };
   const runs = areas.tileRuns?.[side] || [];
   if (runs.length > 0) data.tileRuns = runs.map(rectToArray);
-  const fixedRuns = areas.fixedRuns?.[side] || [];
+  // Fixed runs (ornaments/gems) are exported at their FULL cross height so the
+  // runtime can draw them sticking out past the thin edge strip without scanning
+  // pixels itself. The detected runs are clamped to the strip, so expand here.
+  const fixedRuns = (areas.fixedRuns?.[side] || []).map((r) => expandRunFullCross(frame, side, r, areas.center));
   if (fixedRuns.length > 0) data.fixedRuns = fixedRuns.map(rectToArray);
   return data;
 }
