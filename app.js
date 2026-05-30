@@ -48,6 +48,12 @@ const els = {
   sliceLengthOut: document.getElementById("sliceLengthOut"),
   areaStats: document.getElementById("areaStats"),
   selectionStats: document.getElementById("selectionStats"),
+  gridViewBtn: document.getElementById("gridViewBtn"),
+  gridViewModal: document.getElementById("gridViewModal"),
+  gridViewCloseBtn: document.getElementById("gridViewCloseBtn"),
+  gridApplyCurrentBtn: document.getElementById("gridApplyCurrentBtn"),
+  gridFrameCount: document.getElementById("gridFrameCount"),
+  gridViewGrid: document.getElementById("gridViewGrid"),
   processSliceReadout: document.getElementById("processSliceReadout"),
   processInsidePx: document.getElementById("processInsidePx"),
   processOutsidePx: document.getElementById("processOutsidePx"),
@@ -82,6 +88,10 @@ const state = {
   processedCanvas: document.createElement("canvas"),
   hasProcessedPatches: false,
   processingBusy: false,
+  gridView: {
+    active: false,
+    visible: false,
+  },
   sliceScans: new Map(),
   manualMode: false,
   sourceDrag: null,
@@ -257,6 +267,7 @@ function activateImage(image, name, alreadyFlushed = false) {
   clearProcessedPatches(false);
   state.sliceScans.clear();
   state.selectedId = null;
+  closeGridView(true);
   state.sourceHasAlpha = detectExistingAlpha(state.originalData);
 
   const roleColors = sampleRoleColors(state.originalData);
@@ -662,6 +673,28 @@ function getUiSettings() {
   };
 }
 
+function cloneSettings(settings) {
+  return JSON.parse(JSON.stringify(settings));
+}
+
+function applyAreaUiSettings(settings) {
+  if (!settings) return;
+  setInputValue(els.sliceThreshold, settings.areas?.sliceThreshold);
+  setInputValue(els.sliceBridgeGap, settings.areas?.sliceBridgeGap);
+  setInputValue(els.sliceCornerGuard, settings.areas?.sliceCornerGuard);
+  setInputValue(els.sliceLengthLimit, settings.areas?.sliceLengthLimit);
+  setAutoSideFlags(settings.areas?.autoSides);
+  if (settings.areas?.autoMode) state.autoMode = normalizeAutoMode(settings.areas.autoMode);
+  if (settings.previewMode) state.previewMode = settings.previewMode;
+  syncModeButtons("[data-preview-mode]", "previewMode", state.previewMode);
+  updateControlLabels();
+}
+
+function applyFrameAreaSettings(frame) {
+  if (!frame) return;
+  applyAreaUiSettings(state.frameSettings.get(frame.id));
+}
+
 function applyUiSettings(settings) {
   if (!settings) return;
   setInputValue(els.mainColor, settings.colors?.mainColor);
@@ -940,6 +973,7 @@ function detectExistingAlpha(imageData) {
 
 function detectFrames() {
   if (!state.keyedData) return;
+  closeGridView(true);
   updateControlLabels();
   const previousSelectedKey = getSelectedFrame() ? frameStorageKey(getSelectedFrame()) : null;
   state.sliceScans.clear();
@@ -1121,6 +1155,17 @@ function componentsWithinPixelGap(source, target, targetLabel, labels, width, he
 
 function getSelectedFrame() {
   return state.frames.find((frame) => frame.id === state.selectedId) || null;
+}
+
+function selectFrameById(frameId, options = {}) {
+  const frame = state.frames.find((candidate) => candidate.id === frameId);
+  if (!frame) return null;
+  if (state.selectedId !== frame.id) clearSelectedSlice(false);
+  state.selectedId = frame.id;
+  if (options.applyStoredSettings !== false) applyFrameAreaSettings(frame);
+  scheduleSaveCurrentImageState();
+  if (options.render !== false) renderAll();
+  return frame;
 }
 
 function getSelectedPatch() {
@@ -1313,6 +1358,102 @@ function findTransparentCenterRect(frame) {
     w: 1,
     h: 1,
   };
+}
+
+// Bounding box of the connected transparent region INSIDE the frame (flood-filled
+// from the centre; the opaque border blocks leaks to the exterior). This is the
+// hole the background fills. Unlike findTransparentCenterRect (a largest-inscribed
+// rect) it captures the full extent of a non-rectangular hole (rounded/V tops), so
+// it may overdraw slightly under those edges — acceptable; the border paints on top.
+function findInteriorTransparentBounds(frame) {
+  if (!state.keyedData) return { x: 0, y: 0, w: frame.w, h: frame.h };
+  const alphaThreshold = Number(els.alphaThreshold.value);
+  const data = state.keyedData.data;
+  const width = state.keyedData.width;
+  const fw = frame.w;
+  const fh = frame.h;
+  const transparent = (x, y) => data[((frame.y + y) * width + frame.x + x) * 4 + 3] <= alphaThreshold;
+
+  // Seed: nearest transparent pixel to the centre (rings outward).
+  const cx = Math.floor(fw / 2);
+  const cy = Math.floor(fh / 2);
+  let seed = null;
+  const maxR = Math.max(fw, fh);
+  for (let r = 0; r <= maxR && !seed; r += 1) {
+    for (let dy = -r; dy <= r && !seed; dy += 1) {
+      for (let dx = -r; dx <= r; dx += 1) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const x = cx + dx;
+        const y = cy + dy;
+        if (x < 0 || y < 0 || x >= fw || y >= fh) continue;
+        if (transparent(x, y)) { seed = { x, y }; break; }
+      }
+    }
+  }
+  if (!seed) return { x: cx, y: cy, w: 1, h: 1 };
+
+  const visited = new Uint8Array(fw * fh);
+  const stack = [seed.y * fw + seed.x];
+  visited[seed.y * fw + seed.x] = 1;
+  let minX = seed.x;
+  let maxX = seed.x;
+  let minY = seed.y;
+  let maxY = seed.y;
+  const push = (nx, ny) => {
+    if (nx < 0 || ny < 0 || nx >= fw || ny >= fh) return;
+    const ni = ny * fw + nx;
+    if (visited[ni] || !transparent(nx, ny)) return;
+    visited[ni] = 1;
+    stack.push(ni);
+  };
+  while (stack.length > 0) {
+    const idx = stack.pop();
+    const x = idx % fw;
+    const y = (idx - x) / fw;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    push(x - 1, y);
+    push(x + 1, y);
+    push(x, y - 1);
+    push(x, y + 1);
+  }
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+
+// Expand a medallion rect's CROSS extent (perpendicular to its edge) to the
+// gem's full opaque bounds within the side margin, keeping its along-span. The
+// detected medallion is otherwise clamped to the thin edge strip, which clips
+// the gem so it can't stick out past the border. Mirrors MultiPatchFrame._full_cross.
+function expandMedallionFullCross(frame, side, m, center) {
+  if (!state.keyedData || !center) return m;
+  const horizontal = side === "top" || side === "bottom";
+  const data = state.keyedData.data;
+  const width = state.keyedData.width;
+  const threshold = Number(els.alphaThreshold.value);
+  const opaque = (x, y) => data[((frame.y + y) * width + frame.x + x) * 4 + 3] > threshold;
+  let s0;
+  let s1;
+  if (side === "top") { s0 = 0; s1 = Math.max(1, Math.round(center.y)); }
+  else if (side === "bottom") { s0 = Math.round(center.y + center.h); s1 = frame.h; }
+  else if (side === "left") { s0 = 0; s1 = Math.max(1, Math.round(center.x)); }
+  else { s0 = Math.round(center.x + center.w); s1 = frame.w; }
+  const a0 = Math.round(horizontal ? m.x : m.y);
+  const a1 = Math.round(horizontal ? m.x + m.w : m.y + m.h);
+  let lo = -1;
+  let hi = -1;
+  for (let c = clamp(s0, 0, frame.h); c < clamp(s1, 0, horizontal ? frame.h : frame.w); c += 1) {
+    let op = false;
+    for (let a = a0; a < a1; a += 1) {
+      if (horizontal ? opaque(a, c) : opaque(c, a)) { op = true; break; }
+    }
+    if (op) { if (lo < 0) lo = c; hi = c; }
+  }
+  if (lo < 0) return m;
+  return horizontal
+    ? { x: m.x, y: lo, w: m.w, h: hi - lo + 1 }
+    : { x: lo, y: m.y, w: hi - lo + 1, h: m.h };
 }
 
 function sideDefaultRect(frame, center, side) {
@@ -2572,10 +2713,7 @@ function renderFrameList() {
     item.type = "button";
     item.className = `frame-item${frame.id === state.selectedId ? " selected" : ""}`;
     item.addEventListener("click", () => {
-      if (state.selectedId !== frame.id) clearSelectedSlice(false);
-      state.selectedId = frame.id;
-      scheduleSaveCurrentImageState();
-      renderAll();
+      selectFrameById(frame.id);
     });
     const canvas = document.createElement("canvas");
     canvas.width = 120;
@@ -2916,6 +3054,121 @@ function renderPreviews() {
   stage.append(outerCanvas, stack);
   previewFrame.append(title, stage);
   els.previewGrid.append(previewFrame);
+}
+
+function applyCurrentSettingsToGridFrames() {
+  if (state.frames.length === 0) return;
+  const settings = cloneSettings(getUiSettings());
+  const sideFlags = getAutoSideFlags();
+  state.sliceScans.clear();
+  for (const frame of state.frames) {
+    const areas = suggestAutoEdgeAreas(frame, sideFlags);
+    const patch = suggestAutoPatch(frame, areas);
+    if (areas) state.edgeAreas.set(frame.id, areas);
+    if (patch) state.patches.set(frame.id, patch);
+    state.frameSettings.set(frame.id, cloneSettings(settings));
+  }
+  clearSelectedSlice(false);
+  scheduleSaveCurrentImageState();
+  renderAll();
+}
+
+function openGridView() {
+  if (state.frames.length === 0) {
+    setStatus("Detect frames before opening Grid View.");
+    return;
+  }
+  hideEditorContextMenu();
+  if (!state.gridView.active) {
+    applyCurrentSettingsToGridFrames();
+    state.gridView.active = true;
+  }
+  state.gridView.visible = true;
+  if (els.gridViewModal) els.gridViewModal.hidden = false;
+  document.body.classList.add("modal-open");
+  renderGridView();
+}
+
+function closeGridView(endSession = false) {
+  state.gridView.visible = false;
+  if (endSession) state.gridView.active = false;
+  if (els.gridViewModal) els.gridViewModal.hidden = true;
+  document.body.classList.remove("modal-open");
+}
+
+function selectGridFrame(frameId) {
+  const frame = selectFrameById(frameId);
+  if (!frame) return;
+  closeGridView(false);
+  setStatus(`${frame.name} selected. Adjust Areas, then open Grid View to return.`);
+}
+
+function renderGridView() {
+  if (!els.gridViewGrid || !state.gridView.visible) return;
+  els.gridViewGrid.innerHTML = "";
+  if (els.gridFrameCount) {
+    els.gridFrameCount.textContent = `${state.frames.length} frame${state.frames.length === 1 ? "" : "s"}`;
+  }
+  if (state.frames.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "grid-empty";
+    empty.textContent = "No frames detected.";
+    els.gridViewGrid.append(empty);
+    return;
+  }
+
+  for (const frame of state.frames) {
+    const areas = state.edgeAreas.get(frame.id) || suggestEdgeAreas(frame);
+    if (!state.edgeAreas.has(frame.id)) state.edgeAreas.set(frame.id, areas);
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = `grid-frame-card${frame.id === state.selectedId ? " selected" : ""}`;
+    card.addEventListener("click", () => selectGridFrame(frame.id));
+
+    const title = document.createElement("div");
+    title.className = "grid-card-title";
+    const name = document.createElement("strong");
+    name.textContent = frame.name;
+    const size = document.createElement("span");
+    size.textContent = `${frame.w}x${frame.h}`;
+    title.append(name, size);
+
+    const preview = document.createElement("div");
+    preview.className = "grid-card-preview";
+    preview.append(
+      createGridMini(frame, areas, "Minimum", "full"),
+      createGridMini(frame, areas, "Corners", "corners"),
+    );
+    card.append(title, preview);
+    els.gridViewGrid.append(card);
+  }
+}
+
+// Renders one labeled, self-contained preview for a grid card. Each variant gets
+// its own canvas/box so the sections sit side by side instead of overlapping.
+function createGridMini(frame, areas, label, variant) {
+  const size = getEdgePreviewSize(frame, areas, variant);
+  const maxW = 110;
+  const maxH = 150;
+  const scale = Math.min(maxW / Math.max(1, size.w), maxH / Math.max(1, size.h), 2);
+  const canvas = document.createElement("canvas");
+  canvas.className = "grid-mini-canvas";
+  canvas.width = Math.max(1, Math.round(size.w * scale));
+  canvas.height = Math.max(1, Math.round(size.h * scale));
+  const ctx = canvas.getContext("2d");
+  ctx.scale(scale, scale);
+  renderEdgeFrame(ctx, frame, areas, size.w, size.h, state.previewMode, variant);
+
+  const cell = document.createElement("div");
+  cell.className = "grid-mini";
+  const title = document.createElement("div");
+  title.className = "grid-mini-title";
+  title.innerHTML = `<strong>${label}</strong><span>${size.w}x${size.h}</span>`;
+  const stage = document.createElement("div");
+  stage.className = "grid-mini-stage";
+  stage.append(canvas);
+  cell.append(title, stage);
+  return cell;
 }
 
 function getPreviewFrameLayout(frame, areas, fullMin, cornersMin) {
@@ -4001,10 +4254,7 @@ function selectFrameAt(point) {
   ));
   if (hits.length === 0) return;
   hits.sort((a, b) => (a.w * a.h) - (b.w * b.h));
-  if (state.selectedId !== hits[0].id) clearSelectedSlice(false);
-  state.selectedId = hits[0].id;
-  scheduleSaveCurrentImageState();
-  renderAll();
+  selectFrameById(hits[0].id);
 }
 
 function findNearestGuide(point) {
@@ -4482,6 +4732,7 @@ function serializePatch(frame) {
     image: state.imageName,
     sourceRect: [frame.x, frame.y, frame.w, frame.h],
     transparentCenter: rectToArray(areas.center),
+    backgroundRect: rectToArray(findInteriorTransparentBounds(frame)),
     areas: {
       top: serializeEdgeSide(areas, "top", "x", mode),
       bottom: serializeEdgeSide(areas, "bottom", "x", mode),
@@ -4494,7 +4745,7 @@ function serializePatch(frame) {
         bottomRight: rectToArray(corners.bottomRight),
       },
       medallions: Object.fromEntries(
-        Object.entries(areas.medallions || {}).map(([side, rect]) => [side, rectToArray(rect)]),
+        Object.entries(areas.medallions || {}).map(([side, rect]) => [side, rectToArray(expandMedallionFullCross(frame, side, rect, areas.center))]),
       ),
     },
     colors: {
@@ -4571,24 +4822,91 @@ function downloadBlob(name, blob) {
   }, 0);
 }
 
-function downloadFrameCrop(frame, prefix = "") {
-  if (!frame) return;
+function frameCropCanvas(frame) {
   const canvas = document.createElement("canvas");
   canvas.width = frame.w;
   canvas.height = frame.h;
   canvas.getContext("2d").drawImage(getRenderCanvas(), frame.x, frame.y, frame.w, frame.h, 0, 0, frame.w, frame.h);
-  canvas.toBlob((blob) => {
+  return canvas;
+}
+
+function canvasToPngBytes(canvas) {
+  return new Promise((resolve) => {
+    canvas.toBlob(async (blob) => {
+      resolve(blob ? new Uint8Array(await blob.arrayBuffer()) : null);
+    }, "image/png");
+  });
+}
+
+function downloadFrameCrop(frame, prefix = "") {
+  if (!frame) return;
+  frameCropCanvas(frame).toBlob((blob) => {
     if (blob) downloadBlob(`${prefix}${frameFileBase(frame)}.png`, blob);
   }, "image/png");
 }
 
-function downloadCurrentCrop() {
-  downloadFrameCrop(getSelectedFrame());
+// Minimal store-only (no compression) ZIP writer. PNGs/JSON are bundled into one
+// file so a single download fires instead of a burst the browser would throttle.
+const ZIP_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function zipCrc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) c = ZIP_CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
 }
 
-function downloadAllCrops() {
-  const prefix = `${imageFileBase()}.`;
-  state.frames.forEach((frame) => downloadFrameCrop(frame, prefix));
+function buildZipBlob(entries) {
+  const encoder = new TextEncoder();
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+  const u16 = (v) => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v & 0xffff, true); return b; };
+  const u32 = (v) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v >>> 0, true); return b; };
+  const DOS_TIME = 0;
+  const DOS_DATE = 0x21; // 1980-01-01, a valid placeholder date
+
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.name);
+    const data = entry.data;
+    const crc = zipCrc32(data);
+    const localHeader = [
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(DOS_TIME), u16(DOS_DATE),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0), nameBytes,
+    ];
+    let headerLen = 0;
+    for (const part of localHeader) { chunks.push(part); headerLen += part.length; }
+    chunks.push(data);
+    central.push([
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(DOS_TIME), u16(DOS_DATE),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0), u16(0),
+      u16(0), u16(0), u32(0), u32(offset), nameBytes,
+    ]);
+    offset += headerLen + data.length;
+  }
+
+  const centralStart = offset;
+  let centralSize = 0;
+  for (const record of central) {
+    for (const part of record) { chunks.push(part); centralSize += part.length; }
+  }
+  const eocd = [
+    u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length),
+    u32(centralSize), u32(centralStart), u16(0),
+  ];
+  for (const part of eocd) chunks.push(part);
+  return new Blob(chunks, { type: "application/zip" });
+}
+
+function downloadCurrentCrop() {
+  downloadFrameCrop(getSelectedFrame());
 }
 
 function downloadTransparentSheet() {
@@ -4624,12 +4942,62 @@ function downloadAllJson() {
   );
 }
 
-function downloadAll() {
+const ZIP_README = `Frame Patch Lab export
+======================
+
+Files in this archive:
+  <image>.processed.png   The full keyed/inpainted sheet. Use THIS as the
+                          texture in Godot — MultiPatchFrame indexes into it
+                          via each frame's sourceRect.
+  <image>.<frame>.png     One cropped PNG per detected frame (raw images, not
+                          needed by MultiPatchFrame which uses the sheet).
+  <image>.patches.json    Every frame's patch data ({ frames: [ ... ] }).
+
+Godot usage:
+  1. Copy MultiPatchFrame.gd (and MultiPatchFrameLoader.gd) into your project.
+  2. Import <image>.processed.png and <image>.patches.json.
+  3. var data = MultiPatchFrameLoader.load_patches("res://.../<image>.patches.json")
+     var sheet = load("res://.../<image>.processed.png")
+     var frame = MultiPatchFrameLoader.make_frame_by_name(sheet, data, "Frame 1")
+     frame.size = Vector2(300, 120)
+     add_child(frame)
+
+See README.md in the Frame Patch Lab repo for full details.
+`;
+
+async function downloadAll() {
   flushPendingSave();
-  downloadTransparentSheet();
-  downloadAllCrops();
-  downloadAllJson();
-  setStatus(`Exporting sheet, ${state.frames.length} crop${state.frames.length === 1 ? "" : "s"}, and JSON.`);
+  setStatus("Bundling export...");
+  const base = imageFileBase();
+  const entries = [];
+
+  const sheet = getRenderCanvas();
+  if (sheet.width && sheet.height) {
+    const bytes = await canvasToPngBytes(sheet);
+    if (bytes) entries.push({ name: `${base}.processed.png`, data: bytes });
+  }
+
+  for (const frame of state.frames) {
+    const bytes = await canvasToPngBytes(frameCropCanvas(frame));
+    if (bytes) entries.push({ name: `${base}.${frameFileBase(frame)}.png`, data: bytes });
+  }
+
+  const payload = {
+    image: state.imageName,
+    generatedBy: "Frame Patch Lab",
+    settings: getUiSettings(),
+    frames: state.frames.map((frame) => serializePatch(frame)),
+  };
+  const encoder = new TextEncoder();
+  entries.push({ name: `${base}.patches.json`, data: encoder.encode(JSON.stringify(payload, null, 2)) });
+  entries.push({ name: "README.txt", data: encoder.encode(ZIP_README) });
+
+  if (entries.length === 0) {
+    setStatus("Nothing to export.");
+    return;
+  }
+  downloadBlob(`${base}.zip`, buildZipBlob(entries));
+  setStatus(`Exported ${base}.zip — sheet, ${state.frames.length} crop${state.frames.length === 1 ? "" : "s"}, and JSON.`);
 }
 
 function updateSliceScanControls() {
@@ -4778,6 +5146,15 @@ function installEvents() {
     scheduleSaveCurrentImageState();
     renderAll();
   });
+  els.gridViewBtn?.addEventListener("click", openGridView);
+  els.gridViewCloseBtn?.addEventListener("click", () => closeGridView(true));
+  els.gridApplyCurrentBtn?.addEventListener("click", () => {
+    applyCurrentSettingsToGridFrames();
+    state.gridView.active = true;
+    state.gridView.visible = true;
+    renderGridView();
+    setStatus(`Applied current Areas settings to ${state.frames.length} frame${state.frames.length === 1 ? "" : "s"}.`);
+  });
   document.querySelectorAll("[data-area]").forEach((input) => {
     input.addEventListener("change", () => {
       const [side, name] = input.dataset.area.split(".");
@@ -4909,7 +5286,12 @@ function installEvents() {
     hideEditorContextMenu();
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") hideEditorContextMenu();
+    if (event.key !== "Escape") return;
+    if (state.gridView.visible) {
+      closeGridView(true);
+      return;
+    }
+    hideEditorContextMenu();
   });
   window.addEventListener("dragenter", (event) => {
     if (!isFileDrag(event.dataTransfer)) return;

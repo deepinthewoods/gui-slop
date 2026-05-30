@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Frame Patch Lab</title>
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=2">
   </head>
   <body>
     <header class="app-header">
@@ -159,6 +159,7 @@
               <label class="field"><span>Right W</span><input data-area="right.w" type="number" min="1" step="1"></label>
               <label class="field"><span>Right H</span><input data-area="right.h" type="number" min="1" step="1"></label>
             </div>
+            <button id="gridViewBtn" class="full-button grid-view-button" type="button">Grid View</button>
           </section>
 
           <section class="panel export-process-panel">
@@ -222,6 +223,22 @@
       </section>
     </main>
 
-    <script src="app.js"></script>
+    <div id="gridViewModal" class="grid-modal" role="dialog" aria-modal="true" aria-labelledby="gridViewTitle" hidden>
+      <div class="grid-modal-shell">
+        <header class="grid-modal-header">
+          <div>
+            <h2 id="gridViewTitle">Grid View</h2>
+            <p id="gridFrameCount">0 frames</p>
+          </div>
+          <div class="grid-modal-actions">
+            <button id="gridApplyCurrentBtn" type="button">Apply Current to All</button>
+            <button id="gridViewCloseBtn" type="button">Close</button>
+          </div>
+        </header>
+        <div id="gridViewGrid" class="grid-view-grid"></div>
+      </div>
+    </div>
+
+    <script src="app.js?v=2"></script>
   </body>
 </html>

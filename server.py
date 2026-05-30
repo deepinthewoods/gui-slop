@@ -62,6 +62,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        # Never let the browser serve a stale app.js / styles.css from cache.
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         super().end_headers()
 
     def do_OPTIONS(self):
