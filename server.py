@@ -8,10 +8,12 @@ import shutil
 import subprocess
 import tempfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+APP_ROOT = Path(__file__).resolve().parent
 
 PRESETS = {
     "fastAverage": ["inpaint[0]", "[1],0,1"],
@@ -79,6 +81,14 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/api/images":
+            images = sorted(
+                entry.name
+                for entry in APP_ROOT.iterdir()
+                if entry.is_file() and entry.suffix.lower() == ".png"
+            )
+            self.send_json(200, {"images": images})
+            return
         if self.path == "/api/gmic/status":
             gmic_path = shutil.which("gmic")
             self.send_json(200, {

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Frame Patch Lab</title>
-    <link rel="stylesheet" href="styles.css?v=2">
+    <link rel="stylesheet" href="styles.css?v=16">
   </head>
   <body>
     <header class="app-header">
@@ -16,6 +16,10 @@
         <label class="field inline">
           <span>Image</span>
           <select id="imageSelect"></select>
+        </label>
+        <label class="check-field" title="Raise less-saturated images in a family to match its most saturated member.">
+          <input id="matchSeriesSaturation" type="checkbox" checked>
+          <span>Match series saturation</span>
         </label>
         <label class="file-button">
           Load Images
@@ -109,6 +113,7 @@
             <div class="panel-heading">
               <h2>Areas</h2>
               <div class="patch-actions">
+                <button id="wizardBtn" type="button">Wizard</button>
                 <button id="autoGuidesBtn" type="button">Slice Scan</button>
               </div>
             </div>
@@ -134,6 +139,16 @@
               <label class="field">
                 <span>Thickness tolerance <output id="sliceLengthOut">2 px</output></span>
                 <input id="sliceLengthLimit" type="range" min="0" max="20" value="2">
+              </label>
+              <label class="check-field"><input id="showInsideRect" type="checkbox"><span>Show inside rect</span></label>
+              <label class="check-field"><input id="centerMedallions" type="checkbox"><span>Center medallions</span></label>
+              <label class="field">
+                <span>Inside-rect tolerance <output id="insidePercentOut">85%</output></span>
+                <input id="insidePercentile" type="range" min="50" max="100" value="85">
+              </label>
+              <label class="field">
+                <span>Max medallions / side <output id="maxMedallionsOut">∞</output></span>
+                <input id="maxMedallions" type="range" min="0" max="12" value="12">
               </label>
             </div>
             <div class="editor-canvas-wrap">
@@ -239,6 +254,56 @@
       </div>
     </div>
 
-    <script src="app.js?v=2"></script>
+    <div id="wizardModal" class="wizard-modal" role="dialog" aria-modal="true" aria-labelledby="wizardTitle" hidden>
+      <div class="wizard-shell">
+        <header class="wizard-header">
+          <div class="wizard-heading">
+            <div>
+              <h2 id="wizardTitle">Slice Wizard</h2>
+              <p id="wizardSummary">Choose the cleanest resize. A left click accepts it and advances to the next frame.</p>
+            </div>
+            <div class="wizard-legend" aria-label="Wizard controls">
+              <span><kbd>Left click</kbd> accept + next frame</span>
+              <span><kbd>Open in Editor</kbd> adjust provisionally</span>
+              <span><kbd>Right click</kbd> keep as parent</span>
+              <span><kbd>Hold Shift</kbd> mix T/B/L/R; fourth accepts</span>
+              <span id="wizardSideSelectionStatus" class="wizard-side-selection-status" aria-label="Selected mixed sides" aria-live="polite">
+                <b data-wizard-selection-side="left">L</b>
+                <b data-wizard-selection-side="right">R</b>
+                <b data-wizard-selection-side="top">T</b>
+                <b data-wizard-selection-side="bottom">B</b>
+              </span>
+              <span><kbd>Space</kbd> breed selected</span>
+              <span><kbd>Backspace</kbd> fresh 15</span>
+              <span><kbd>L</kbd> long 15 + inpaint</span>
+              <span><kbd>Esc</kbd> clear selected</span>
+              <span id="wizardMedallionHint"><kbd>Hold Ctrl</kbd> hide medallions; Ctrl-click accepts all hidden; Ctrl+Shift pick keeps that side hidden</span>
+            </div>
+          </div>
+          <div class="wizard-actions">
+            <label class="wizard-medallion-control" title="Limit automatic detection to at most this many fixed medallions on each usable side. Use 0 to disable medallions.">
+              <input id="wizardLimitMedallions" type="checkbox">
+              <span>Max medallions</span>
+              <input id="wizardMaxMedallions" type="number" min="0" max="6" step="1" value="1" disabled aria-label="Maximum medallions per side">
+              <span>/ side</span>
+            </label>
+            <div class="mode-tabs wizard-scale-tabs" role="group" aria-label="Preview pixel scale">
+              <button data-wizard-scale="0.5" type="button">0.5×</button>
+              <button class="active" data-wizard-scale="1" type="button">1×</button>
+              <button data-wizard-scale="2" type="button">2×</button>
+              <button data-wizard-scale="4" type="button">4×</button>
+            </div>
+            <button id="wizardRefreshBtn" type="button" title="Shortcut: Backspace">Fresh 15</button>
+            <button id="wizardLongBtn" type="button" title="Random repeat regions of at least 30% of the usable side, with randomized provisional inpaint distances. Shortcut: L">Long 15</button>
+            <button id="wizardBreedBtn" type="button" title="Shortcut: Space" disabled>Breed Selected</button>
+            <button id="wizardClearBtn" type="button" title="Shortcut: Escape" disabled>Clear Selected</button>
+            <button id="wizardCloseBtn" type="button">Close</button>
+          </div>
+        </header>
+        <div id="wizardGrid" class="wizard-grid"></div>
+      </div>
+    </div>
+
+    <script src="app.js?v=18"></script>
   </body>
 </html>
