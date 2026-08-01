@@ -2,14 +2,26 @@ const BUILTIN_IMAGES = [
   "test.png",
   "frame_11.png",
   "frame_13.png",
+  "sample_0a.png",
+  "sample_0b.png",
+  "sample_1a.png",
+  "sample_1b.png",
+  "sample_2a.png",
+  "sample_2b.png",
+  "vines_1a.png",
+  "vines_1b.png",
   "image_20260517_193318.png",
   "image_20260517_164554.png",
 ];
 
+const builtinImageSelections = new Map();
+
 const els = {
   statusText: document.getElementById("statusText"),
   imageSelect: document.getElementById("imageSelect"),
+  matchSeriesSaturation: document.getElementById("matchSeriesSaturation"),
   fileInput: document.getElementById("fileInput"),
+  importZipInput: document.getElementById("importZipInput"),
   mainColor: document.getElementById("mainColor"),
   mainTint: document.getElementById("mainTint"),
   mainDesaturate: document.getElementById("mainDesaturate"),
@@ -36,6 +48,7 @@ const els = {
   sourceCanvas: document.getElementById("sourceCanvas"),
   editorCanvas: document.getElementById("editorCanvas"),
   editorContextMenu: document.getElementById("editorContextMenu"),
+  wizardBtn: document.getElementById("wizardBtn"),
   autoGuidesBtn: document.getElementById("autoGuidesBtn"),
   autoSideInputs: [...document.querySelectorAll("[data-auto-side]")],
   sliceThreshold: document.getElementById("sliceThreshold"),
@@ -46,6 +59,12 @@ const els = {
   sliceCornerOut: document.getElementById("sliceCornerOut"),
   sliceLengthLimit: document.getElementById("sliceLengthLimit"),
   sliceLengthOut: document.getElementById("sliceLengthOut"),
+  showInsideRect: document.getElementById("showInsideRect"),
+  centerMedallions: document.getElementById("centerMedallions"),
+  insidePercentile: document.getElementById("insidePercentile"),
+  insidePercentOut: document.getElementById("insidePercentOut"),
+  maxMedallions: document.getElementById("maxMedallions"),
+  maxMedallionsOut: document.getElementById("maxMedallionsOut"),
   areaStats: document.getElementById("areaStats"),
   selectionStats: document.getElementById("selectionStats"),
   gridViewBtn: document.getElementById("gridViewBtn"),
@@ -54,6 +73,18 @@ const els = {
   gridApplyCurrentBtn: document.getElementById("gridApplyCurrentBtn"),
   gridFrameCount: document.getElementById("gridFrameCount"),
   gridViewGrid: document.getElementById("gridViewGrid"),
+  wizardModal: document.getElementById("wizardModal"),
+  wizardSummary: document.getElementById("wizardSummary"),
+  wizardMedallionHint: document.getElementById("wizardMedallionHint"),
+  wizardSideSelectionStatus: document.getElementById("wizardSideSelectionStatus"),
+  wizardGrid: document.getElementById("wizardGrid"),
+  wizardRefreshBtn: document.getElementById("wizardRefreshBtn"),
+  wizardLongBtn: document.getElementById("wizardLongBtn"),
+  wizardBreedBtn: document.getElementById("wizardBreedBtn"),
+  wizardClearBtn: document.getElementById("wizardClearBtn"),
+  wizardLimitMedallions: document.getElementById("wizardLimitMedallions"),
+  wizardMaxMedallions: document.getElementById("wizardMaxMedallions"),
+  wizardCloseBtn: document.getElementById("wizardCloseBtn"),
   processSliceReadout: document.getElementById("processSliceReadout"),
   processInsidePx: document.getElementById("processInsidePx"),
   processOutsidePx: document.getElementById("processOutsidePx"),
@@ -71,6 +102,7 @@ const els = {
 const state = {
   imageName: "",
   sourceImage: null,
+  imageSeries: null,
   originalCanvas: document.createElement("canvas"),
   keyedCanvas: document.createElement("canvas"),
   maskCanvas: document.createElement("canvas"),
@@ -87,10 +119,34 @@ const state = {
   processedPatches: new Map(),
   processedCanvas: document.createElement("canvas"),
   hasProcessedPatches: false,
+  renderCanvasOverride: null,
   processingBusy: false,
   gridView: {
     active: false,
     visible: false,
+  },
+  wizard: {
+    visible: false,
+    generation: 0,
+    serial: 0,
+    previewScale: 1,
+    hideMedallions: false,
+    candidateKind: "fresh",
+    processing: false,
+    processingLabel: "",
+    previewBatchId: 0,
+    previewBatch: null,
+    frameId: null,
+    editorSession: null,
+    acceptedFrameIds: new Set(),
+    limitMedallions: false,
+    maxMedallions: 1,
+    candidates: [],
+    parentIds: new Set(),
+    sideAssemblyActive: false,
+    sideCandidateIds: {},
+    sideMedallionsHidden: {},
+    sideSources: {},
   },
   sliceScans: new Map(),
   manualMode: false,
@@ -99,9 +155,11 @@ const state = {
   editorZoom: 2,
   previewMode: "stretch",
   autoMode: "sliceScan",
+  centerMedallions: false,
 };
 
 const EDGE_SIDES = ["top", "bottom", "left", "right"];
+const WIZARD_PREVIEW_SCALES = [0.5, 1, 2, 4];
 const EDITOR_ZOOM_MIN = 1;
 const EDITOR_ZOOM_MAX = 12;
 const PROCESS_PRESETS = {
@@ -217,13 +275,77 @@ function drawChecker(ctx, w, h, size = 12) {
   ctx.restore();
 }
 
-function initImageOptions() {
+function builtinImageFamily(name) {
+  const match = name.match(/^(.*?)([a-z0-9])\.png$/i);
+  if (!match || !match[1]) return null;
+  const suffix = match[2].toLowerCase();
+  return {
+    base: match[1],
+    kind: /\d/.test(suffix) ? "number" : "letter",
+    suffix,
+  };
+}
+
+function groupedBuiltinImageOptions(names) {
+  const families = new Map();
+  for (const name of names) {
+    const family = builtinImageFamily(name);
+    if (!family) continue;
+    const key = `${family.kind}:${family.base.toLowerCase()}`;
+    if (!families.has(key)) families.set(key, []);
+    families.get(key).push({ name, ...family });
+  }
+
+  const emitted = new Set();
+  const entries = [];
+  for (const name of names) {
+    const family = builtinImageFamily(name);
+    const key = family ? `${family.kind}:${family.base.toLowerCase()}` : null;
+    const members = key ? families.get(key) : null;
+    if (!members || members.length < 2) {
+      entries.push({ value: name, label: name, name, names: [name] });
+      continue;
+    }
+    if (emitted.has(key)) continue;
+    emitted.add(key);
+    members.sort((a, b) => a.suffix.localeCompare(b.suffix, undefined, { numeric: true }));
+    const memberNames = members.map((member) => member.name);
+    const suffixes = members.map((member) => member.suffix);
+    const displayBase = family.base.replace(/[_. -]+$/, "") || family.base;
+    entries.push({
+      value: `@group:${key}`,
+      label: `${displayBase} [${suffixes.join(", ")}] · ${members.length} PNGs`,
+      name: `${displayBase}_${suffixes.join("")}.combined.png`,
+      names: memberNames,
+    });
+  }
+  return entries;
+}
+
+async function availableBuiltinImages() {
+  try {
+    const response = await fetch("/api/images", { cache: "no-store" });
+    if (!response.ok) return BUILTIN_IMAGES;
+    const payload = await response.json();
+    const names = Array.isArray(payload.images)
+      ? payload.images.filter((name) => typeof name === "string" && /\.png$/i.test(name))
+      : [];
+    return names.length > 0 ? names : BUILTIN_IMAGES;
+  } catch {
+    return BUILTIN_IMAGES;
+  }
+}
+
+async function initImageOptions() {
+  const names = await availableBuiltinImages();
   els.imageSelect.innerHTML = "";
-  for (const name of BUILTIN_IMAGES) {
+  builtinImageSelections.clear();
+  for (const entry of groupedBuiltinImageOptions(names)) {
     const option = document.createElement("option");
-    option.value = name;
-    option.textContent = name;
+    option.value = entry.value;
+    option.textContent = entry.label;
     els.imageSelect.append(option);
+    builtinImageSelections.set(entry.value, entry);
   }
 }
 
@@ -235,7 +357,7 @@ function imageElementHeight(image) {
   return image.naturalHeight || image.height || 0;
 }
 
-function activateImage(image, name, alreadyFlushed = false) {
+function activateImage(image, name, alreadyFlushed = false, imageSeries = null) {
   const width = imageElementWidth(image);
   const height = imageElementHeight(image);
   if (width <= 0 || height <= 0) {
@@ -247,6 +369,7 @@ function activateImage(image, name, alreadyFlushed = false) {
   if (!alreadyFlushed) flushPendingSave();
   state.imageName = name;
   state.sourceImage = image;
+  state.imageSeries = imageSeries;
   state.originalCanvas.width = width;
   state.originalCanvas.height = height;
   state.keyedCanvas.width = width;
@@ -268,6 +391,7 @@ function activateImage(image, name, alreadyFlushed = false) {
   state.sliceScans.clear();
   state.selectedId = null;
   closeGridView(true);
+  closeWizard(true);
   state.sourceHasAlpha = detectExistingAlpha(state.originalData);
 
   const roleColors = sampleRoleColors(state.originalData);
@@ -304,6 +428,47 @@ function loadImage(src, name, cleanupUrls = []) {
   img.src = src;
 }
 
+function loadBuiltinImageElement(name) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ name, img });
+    img.onerror = () => reject(new Error(`Could not load ${name}`));
+    img.src = name;
+  });
+}
+
+async function loadBuiltinImageSelection(value) {
+  const entry = builtinImageSelections.get(value);
+  if (!entry || entry.names.length === 1) {
+    const name = entry?.names[0] || value;
+    loadImage(name, name);
+    return;
+  }
+
+  pendingFileImportToken += 1;
+  const loadToken = ++pendingImageLoadToken;
+  flushPendingSave();
+  setStatus(`Loading ${entry.names.length} images from ${entry.label}...`);
+  const results = await Promise.allSettled(entry.names.map(loadBuiltinImageElement));
+  if (loadToken !== pendingImageLoadToken) return;
+  const images = results
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => result.value);
+  const failedCount = results.length - images.length;
+  if (images.length === 0) {
+    setStatus(`Could not load the ${entry.label} image family.`);
+    return;
+  }
+
+  const seriesEntries = images.length > 1 ? snapshotImageEntries(images) : null;
+  const image = seriesEntries ? composeImageSheet(seriesEntries) : images[0].img;
+  const imageSeries = seriesEntries ? { entries: seriesEntries, name: entry.name } : null;
+  activateImage(image, entry.name, true, imageSeries);
+  if (failedCount > 0) {
+    setStatus(`${entry.name}: loaded ${images.length} images, skipped ${failedCount}.`);
+  }
+}
+
 function isImageFile(file) {
   if (!file) return false;
   return file.type.startsWith("image/") || IMAGE_FILE_EXTENSION_RE.test(file.name || "");
@@ -333,13 +498,95 @@ function importedImageName(files) {
   return `${basenames[0]} + ${basenames.length - 1} more.png`;
 }
 
+function imageToCanvas(image) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, imageElementWidth(image));
+  canvas.height = Math.max(1, imageElementHeight(image));
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(image, 0, 0);
+  return canvas;
+}
+
+function snapshotImageEntries(images) {
+  return images.map((entry) => ({
+    name: entry.name || entry.file?.name || "image.png",
+    img: imageToCanvas(entry.img),
+  }));
+}
+
+function imageSaturationLevel(image, percentile = 0.65) {
+  const canvas = image instanceof HTMLCanvasElement ? image : imageToCanvas(image);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const histogram = new Uint32Array(101);
+  const sampleStep = Math.max(1, Math.ceil(Math.sqrt((width * height) / 60000)));
+  let samples = 0;
+  for (let y = 0; y < height; y += sampleStep) {
+    for (let x = 0; x < width; x += sampleStep) {
+      const index = (y * width + x) * 4;
+      if (data[index + 3] < 32) continue;
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const delta = max - min;
+      const lightness = (max + min) / 510;
+      if (delta < 8 || lightness < 0.03 || lightness > 0.97) continue;
+      const denominator = lightness > 0.5 ? 510 - max - min : max + min;
+      const saturation = denominator > 0 ? delta / denominator : 0;
+      histogram[Math.round(clamp(saturation, 0, 1) * 100)] += 1;
+      samples += 1;
+    }
+  }
+  if (samples === 0) return 0;
+  const target = Math.max(1, Math.ceil(samples * clamp(percentile, 0, 1)));
+  let seen = 0;
+  for (let bucket = 0; bucket < histogram.length; bucket += 1) {
+    seen += histogram[bucket];
+    if (seen >= target) return bucket / 100;
+  }
+  return 0;
+}
+
+function imageWithSaturationScale(image, scale) {
+  const canvas = imageToCanvas(image);
+  if (!Number.isFinite(scale) || scale <= 1.01) return canvas;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  for (let index = 0; index < data.length; index += 4) {
+    if (data[index + 3] < 16) continue;
+    const hsl = rgbToHsl(data[index], data[index + 1], data[index + 2]);
+    if (hsl.s <= 0.01) continue;
+    const rgb = hslToRgb(hsl.h, clamp(hsl.s * scale, 0, 1), hsl.l);
+    data[index] = rgb.r;
+    data[index + 1] = rgb.g;
+    data[index + 2] = rgb.b;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+function saturationMatchedImageEntries(images) {
+  const levels = images.map((entry) => imageSaturationLevel(entry.img));
+  const target = Math.max(...levels);
+  return images.map((entry, index) => {
+    const level = levels[index];
+    const scale = target > 0 && level > 0 ? Math.min(3, target / level) : 1;
+    return { ...entry, img: imageWithSaturationScale(entry.img, scale) };
+  });
+}
+
 function composeImageSheet(images) {
-  const columns = images.length <= 2 ? images.length : Math.ceil(Math.sqrt(images.length));
-  const rows = Math.ceil(images.length / columns);
+  const matchSaturation = images.length > 1 && els.matchSeriesSaturation?.checked !== false;
+  const preparedImages = matchSaturation ? saturationMatchedImageEntries(images) : images;
+  const columns = preparedImages.length <= 2 ? preparedImages.length : Math.ceil(Math.sqrt(preparedImages.length));
+  const rows = Math.ceil(preparedImages.length / columns);
   const columnWidths = Array(columns).fill(1);
   const rowHeights = Array(rows).fill(1);
 
-  images.forEach((entry, index) => {
+  preparedImages.forEach((entry, index) => {
     const column = index % columns;
     const row = Math.floor(index / columns);
     columnWidths[column] = Math.max(columnWidths[column], imageElementWidth(entry.img));
@@ -364,7 +611,7 @@ function composeImageSheet(images) {
   canvas.height = height;
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingEnabled = false;
-  images.forEach((entry, index) => {
+  preparedImages.forEach((entry, index) => {
     const column = index % columns;
     const row = Math.floor(index / columns);
     const imageWidth = imageElementWidth(entry.img);
@@ -373,7 +620,15 @@ function composeImageSheet(images) {
     const y = yOffsets[row] + Math.floor((rowHeights[row] - imageHeight) / 2);
     ctx.drawImage(entry.img, x, y);
   });
+  canvas.dataset.saturationMatched = matchSaturation ? "true" : "false";
   return canvas;
+}
+
+function recomposeCurrentImageSeries() {
+  const series = state.imageSeries;
+  if (!series || series.entries.length < 2) return;
+  const image = composeImageSheet(series.entries);
+  activateImage(image, series.name, false, series);
 }
 
 async function loadImageFiles(fileList) {
@@ -401,9 +656,11 @@ async function loadImageFiles(fileList) {
     return;
   }
 
-  const image = images.length === 1 ? images[0].img : composeImageSheet(images);
   const name = importedImageName(images.map((entry) => entry.file));
-  activateImage(image, name);
+  const seriesEntries = images.length > 1 ? snapshotImageEntries(images) : null;
+  const image = seriesEntries ? composeImageSheet(seriesEntries) : images[0].img;
+  const imageSeries = seriesEntries ? { entries: seriesEntries, name } : null;
+  activateImage(image, name, false, imageSeries);
   revokeUrls(images.map((entry) => entry.url));
   if (failedCount > 0) {
     setStatus(`${name}: loaded ${images.length} image${images.length === 1 ? "" : "s"}, skipped ${failedCount}.`);
@@ -558,10 +815,26 @@ function updateControlLabels() {
   if (els.sliceBridgeOut) els.sliceBridgeOut.value = `${els.sliceBridgeGap.value}%`;
   if (els.sliceCornerOut) els.sliceCornerOut.value = `${els.sliceCornerGuard.value}%`;
   if (els.sliceLengthOut) els.sliceLengthOut.value = `${els.sliceLengthLimit.value} px`;
+  if (els.insidePercentOut) els.insidePercentOut.value = `${els.insidePercentile.value}%`;
+  if (els.maxMedallionsOut && els.maxMedallions) {
+    const max = Number(els.maxMedallions.value);
+    els.maxMedallionsOut.value = max >= Number(els.maxMedallions.max) ? "∞" : `${max}`;
+  }
 }
 
 function getRenderCanvas() {
+  if (state.renderCanvasOverride) return state.renderCanvasOverride;
   return state.hasProcessedPatches ? state.processedCanvas : state.keyedCanvas;
+}
+
+function withRenderCanvas(sourceCanvas, callback) {
+  const previous = state.renderCanvasOverride;
+  state.renderCanvasOverride = sourceCanvas || null;
+  try {
+    return callback();
+  } finally {
+    state.renderCanvasOverride = previous;
+  }
 }
 
 function syncProcessedCanvasSize() {
@@ -668,8 +941,11 @@ function getUiSettings() {
       sliceBridgeGap: Number(els.sliceBridgeGap.value),
       sliceCornerGuard: Number(els.sliceCornerGuard.value),
       sliceLengthLimit: Number(els.sliceLengthLimit.value),
+      insidePercentile: Number(els.insidePercentile.value),
+      maxMedallions: Number(els.maxMedallions.value),
     },
     previewMode: state.previewMode,
+    centerMedallions: state.centerMedallions,
   };
 }
 
@@ -683,10 +959,14 @@ function applyAreaUiSettings(settings) {
   setInputValue(els.sliceBridgeGap, settings.areas?.sliceBridgeGap);
   setInputValue(els.sliceCornerGuard, settings.areas?.sliceCornerGuard);
   setInputValue(els.sliceLengthLimit, settings.areas?.sliceLengthLimit);
+  setInputValue(els.insidePercentile, settings.areas?.insidePercentile);
+  setInputValue(els.maxMedallions, settings.areas?.maxMedallions);
   setAutoSideFlags(settings.areas?.autoSides);
   if (settings.areas?.autoMode) state.autoMode = normalizeAutoMode(settings.areas.autoMode);
   if (settings.previewMode) state.previewMode = settings.previewMode;
   syncModeButtons("[data-preview-mode]", "previewMode", state.previewMode);
+  if (settings.centerMedallions != null) state.centerMedallions = settings.centerMedallions;
+  if (els.centerMedallions) els.centerMedallions.checked = state.centerMedallions;
   updateControlLabels();
 }
 
@@ -711,10 +991,14 @@ function applyUiSettings(settings) {
   setInputValue(els.sliceBridgeGap, settings.areas?.sliceBridgeGap);
   setInputValue(els.sliceCornerGuard, settings.areas?.sliceCornerGuard);
   setInputValue(els.sliceLengthLimit, settings.areas?.sliceLengthLimit);
+  setInputValue(els.insidePercentile, settings.areas?.insidePercentile);
+  setInputValue(els.maxMedallions, settings.areas?.maxMedallions);
   setAutoSideFlags(settings.areas?.autoSides);
   if (settings.areas?.autoMode) state.autoMode = normalizeAutoMode(settings.areas.autoMode);
   if (settings.previewMode) state.previewMode = settings.previewMode;
   syncModeButtons("[data-preview-mode]", "previewMode", state.previewMode);
+  if (settings.centerMedallions != null) state.centerMedallions = settings.centerMedallions;
+  if (els.centerMedallions) els.centerMedallions.checked = state.centerMedallions;
   updateControlLabels();
 }
 
@@ -774,6 +1058,14 @@ function serializeSideFlags(flags) {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+function cloneSideModes(modes) {
+  const out = {};
+  for (const side of EDGE_SIDES) {
+    if (typeof modes?.[side] === "string" && modes[side]) out[side] = modes[side];
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 function serializePatchForStorage(patch) {
   if (!patch) return null;
   return {
@@ -796,6 +1088,8 @@ function serializeAreasForStorage(areas) {
     fixedRunsExplicit: areas.fixedRunsExplicit === true,
     fixedRunsExplicitSides: serializeSideFlags(areas.fixedRunsExplicitSides),
     medallions: serializeRectMap(areas.medallions),
+    sideModes: cloneSideModes(areas.sideModes),
+    hiddenMedallionSides: serializeSideFlags(areas.hiddenMedallionSides),
   };
 }
 
@@ -868,6 +1162,8 @@ function deserializeAreasForStorage(frame, value) {
     fixedRunsExplicit: value.fixedRunsExplicit === true,
     fixedRunsExplicitSides: deserializeSideFlags(value.fixedRunsExplicitSides),
     medallions: deserializeRectMap(value.medallions),
+    sideModes: cloneSideModes(value.sideModes),
+    hiddenMedallionSides: deserializeSideFlags(value.hiddenMedallionSides),
   };
   return constrainEdgeAreas(frame, areas);
 }
@@ -878,7 +1174,7 @@ function rememberFrameSettings(frame = getSelectedFrame()) {
 }
 
 function saveCurrentImageState() {
-  if (!state.imageName) return;
+  if (!state.imageName || state.wizard.editorSession) return;
   const root = readStorageRoot();
   const record = getWritableImageRecord(root);
   record.settings = getUiSettings();
@@ -903,6 +1199,10 @@ function saveCurrentImageState() {
 }
 
 function scheduleSaveCurrentImageState() {
+  // A wizard candidate opened in Areas is still provisional. Its geometry is
+  // temporarily mounted in the normal editor so all native drag/resize tools
+  // work, but it must not replace the last accepted frame in local storage.
+  if (state.wizard.editorSession) return;
   clearTimeout(pendingSaveTimer);
   pendingSaveTimer = setTimeout(() => {
     pendingSaveTimer = null;
@@ -1158,6 +1458,12 @@ function getSelectedFrame() {
 }
 
 function selectFrameById(frameId, options = {}) {
+  const wizardEdit = state.wizard.editorSession;
+  if (wizardEdit && frameId !== wizardEdit.frameId && options.allowDuringWizardEdit !== true) {
+    const editingFrame = state.frames.find((candidate) => candidate.id === wizardEdit.frameId);
+    setStatus(`Finish editing ${editingFrame?.name || "the wizard candidate"} by clicking Return to Wizard first.`);
+    return null;
+  }
   const frame = state.frames.find((candidate) => candidate.id === frameId);
   if (!frame) return null;
   if (state.selectedId !== frame.id) clearSelectedSlice(false);
@@ -1266,6 +1572,8 @@ function cloneAreas(areas) {
     fixedRunsExplicit: areas.fixedRunsExplicit === true,
     fixedRunsExplicitSides: cloneSideFlags(areas.fixedRunsExplicitSides),
     medallions: cloneRectMap(areas.medallions),
+    sideModes: cloneSideModes(areas.sideModes),
+    hiddenMedallionSides: cloneSideFlags(areas.hiddenMedallionSides),
   };
 }
 
@@ -1422,6 +1730,113 @@ function findInteriorTransparentBounds(frame) {
   return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
 }
 
+// The "inside" / content-safe rect: the area within backgroundRect where text and
+// icons can be drawn without colliding with the frame. backgroundRect is the FULL
+// extent of the transparent hole, so its edges/corners sit under ornaments. Here we
+// tighten each of the four edges independently by an intrusion-depth percentile:
+// for every row (left/right) or column (top/bottom) we measure how far opaque
+// material reaches inward from the backgroundRect edge before the first transparent
+// pixel, then inset by the 85th percentile of those depths. Robust by design — a
+// corner spike or a mid-edge gem is a minority of samples and gets tolerated (the
+// rect may overlap it slightly), while a consistent border thickness is respected.
+const INSIDE_RECT_PERCENTILE = 0.85;
+
+// Tolerance (0..1) for findInsideRect. Resolved per frame: a saved frame setting
+// wins, else the live UI slider, else the default. Higher = tighter (clears more).
+function getInsidePercentile(frame) {
+  const saved = frame && state.frameSettings.get(frame.id)?.areas?.insidePercentile;
+  const value = saved != null ? saved : Number(els.insidePercentile?.value);
+  if (!Number.isFinite(value)) return INSIDE_RECT_PERCENTILE;
+  return clamp(value / 100, 0.5, 1);
+}
+
+// Cap on auto-generated medallions per side. Resolved per frame (saved setting wins,
+// else the live slider). At/above the slider's max the limit is "off" → Infinity, so
+// the default leaves the previous unlimited behaviour untouched.
+function getMaxMedallionsPerSide(frame) {
+  const saved = frame && state.frameSettings.get(frame.id)?.areas?.maxMedallions;
+  const value = saved != null ? saved : Number(els.maxMedallions?.value);
+  if (!Number.isFinite(value)) return Infinity;
+  const sliderMax = Number(els.maxMedallions?.max);
+  if (Number.isFinite(sliderMax) && value >= sliderMax) return Infinity;
+  return Math.max(0, Math.round(value));
+}
+
+// Keep only the `max` largest runs (by extent along the side's primary axis),
+// preserving their original positional order.
+function limitFixedRunsCount(runs, axis, max) {
+  if (!Number.isFinite(max) || runs.length <= max) return runs;
+  if (max <= 0) return [];
+  return runs
+    .map((rect, index) => ({ rect, index, size: rectPrimaryEnd(rect, axis) - rectPrimaryStart(rect, axis) }))
+    .sort((a, b) => b.size - a.size)
+    .slice(0, max)
+    .sort((a, b) => a.index - b.index)
+    .map((entry) => entry.rect);
+}
+
+function percentileOf(values, p) {
+  if (values.length === 0) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const idx = Math.floor(p * (sorted.length - 1));
+  return sorted[idx];
+}
+
+function findInsideRect(frame, bg) {
+  if (!state.keyedData || !bg || bg.w <= 0 || bg.h <= 0) return bg || { x: 0, y: 0, w: frame.w, h: frame.h };
+  const alphaThreshold = Number(els.alphaThreshold.value);
+  const data = state.keyedData.data;
+  const width = state.keyedData.width;
+  const opaque = (x, y) => data[((frame.y + y) * width + frame.x + x) * 4 + 3] > alphaThreshold;
+
+  // Depth of opaque material reaching inward from the edge at a single line, capped
+  // so a fully-opaque line (no transparent hit) can't collapse the rect past half.
+  const intrudeFrom = (start, end, step, fixed, horizontal) => {
+    let depth = 0;
+    const limit = Math.abs(end - start);
+    for (let i = 0, pos = start; i < limit; i += 1, pos += step) {
+      const x = horizontal ? pos : fixed;
+      const y = horizontal ? fixed : pos;
+      if (!opaque(x, y)) break;
+      depth += 1;
+    }
+    return depth;
+  };
+
+  const x0 = bg.x;
+  const x1 = bg.x + bg.w; // exclusive
+  const y0 = bg.y;
+  const y1 = bg.y + bg.h; // exclusive
+  const left = [];
+  const right = [];
+  for (let y = y0; y < y1; y += 1) {
+    left.push(intrudeFrom(x0, x1, 1, y, true));
+    right.push(intrudeFrom(x1 - 1, x0 - 1, -1, y, true));
+  }
+  const top = [];
+  const bottom = [];
+  for (let x = x0; x < x1; x += 1) {
+    top.push(intrudeFrom(y0, y1, 1, x, false));
+    bottom.push(intrudeFrom(y1 - 1, y0 - 1, -1, x, false));
+  }
+
+  const p = getInsidePercentile(frame);
+  let insetL = percentileOf(left, p);
+  let insetR = percentileOf(right, p);
+  let insetT = percentileOf(top, p);
+  let insetB = percentileOf(bottom, p);
+  // Never let opposing insets cross; keep at least 1px of content each way.
+  if (insetL + insetR > bg.w - 1) { const k = (bg.w - 1) / (insetL + insetR); insetL = Math.floor(insetL * k); insetR = Math.floor(insetR * k); }
+  if (insetT + insetB > bg.h - 1) { const k = (bg.h - 1) / (insetT + insetB); insetT = Math.floor(insetT * k); insetB = Math.floor(insetB * k); }
+
+  return {
+    x: bg.x + insetL,
+    y: bg.y + insetT,
+    w: Math.max(1, bg.w - insetL - insetR),
+    h: Math.max(1, bg.h - insetT - insetB),
+  };
+}
+
 // Expand a run/medallion rect's CROSS extent (perpendicular to its edge) to the
 // ornament's full opaque bounds within the side margin, keeping its along-span.
 // Detected fixed runs are clamped to the thin edge strip, which clips a gem so it
@@ -1431,8 +1846,11 @@ function expandRunFullCross(frame, side, m, center) {
   const horizontal = side === "top" || side === "bottom";
   const data = state.keyedData.data;
   const width = state.keyedData.width;
-  const threshold = Number(els.alphaThreshold.value);
-  const opaque = (x, y) => data[((frame.y + y) * width + frame.x + x) * 4 + 3] > threshold;
+  // A run may contain faint antialiased pixels or a protruding ornament. Treat
+  // every non-transparent pixel as art and only ever expand the incoming cross
+  // span. Replacing it with a tight alpha box can crop top/bottom height or
+  // left/right width.
+  const opaque = (x, y) => data[((frame.y + y) * width + frame.x + x) * 4 + 3] > 0;
   let s0;
   let s1;
   if (side === "top") { s0 = 0; s1 = Math.max(1, Math.round(center.y)); }
@@ -1443,7 +1861,8 @@ function expandRunFullCross(frame, side, m, center) {
   const a1 = Math.round(horizontal ? m.x + m.w : m.y + m.h);
   let lo = -1;
   let hi = -1;
-  for (let c = clamp(s0, 0, frame.h); c < clamp(s1, 0, horizontal ? frame.h : frame.w); c += 1) {
+  const crossLimit = horizontal ? frame.h : frame.w;
+  for (let c = clamp(s0, 0, crossLimit); c < clamp(s1, 0, crossLimit); c += 1) {
     let op = false;
     for (let a = a0; a < a1; a += 1) {
       if (horizontal ? opaque(a, c) : opaque(c, a)) { op = true; break; }
@@ -1451,9 +1870,23 @@ function expandRunFullCross(frame, side, m, center) {
     if (op) { if (lo < 0) lo = c; hi = c; }
   }
   if (lo < 0) return m;
-  return horizontal
-    ? { x: m.x, y: lo, w: m.w, h: hi - lo + 1 }
-    : { x: lo, y: m.y, w: hi - lo + 1, h: m.h };
+  if (horizontal) {
+    const start = Math.min(m.y, lo);
+    const end = Math.max(m.y + m.h, hi + 1);
+    return normalizeRect(frame, { x: m.x, y: start, w: m.w, h: end - start }, 1);
+  }
+  const start = Math.min(m.x, lo);
+  const end = Math.max(m.x + m.w, hi + 1);
+  return normalizeRect(frame, { x: start, y: m.y, w: end - start, h: m.h }, 1);
+}
+
+// Lock a slice's cross extent (thickness) to the opaque pixels spanned by its
+// length, keeping its along-span. Mirrors the export-time expansion so what the
+// user sees in the editor matches what the runtime draws.
+function fitSliceCross(frame, side, rect, areas) {
+  if (!state.keyedData || !areas?.center) return rect;
+  const expanded = expandRunFullCross(frame, side, rect, areas.center);
+  return clampRectInside(expanded, areas[side]);
 }
 
 function sideDefaultRect(frame, center, side) {
@@ -1568,9 +2001,8 @@ function getSideSearchRegion(frame, side, center) {
   return { x: centerRight, y: center.y, w: Math.max(1, frame.w - centerRight), h: center.h };
 }
 
-function alphaBoundsInRect(frame, rect) {
+function alphaBoundsInRect(frame, rect, alphaThreshold = Number(els.alphaThreshold.value)) {
   if (!state.keyedData) return null;
-  const threshold = Number(els.alphaThreshold.value);
   const data = state.keyedData.data;
   const width = state.keyedData.width;
   const search = normalizeRect(frame, rect, 1);
@@ -1581,7 +2013,7 @@ function alphaBoundsInRect(frame, rect) {
   for (let y = search.y; y < search.y + search.h; y += 1) {
     for (let x = search.x; x < search.x + search.w; x += 1) {
       const alpha = data[((frame.y + y) * width + frame.x + x) * 4 + 3];
-      if (alpha <= threshold) continue;
+      if (alpha <= alphaThreshold) continue;
       if (x < minX) minX = x;
       if (y < minY) minY = y;
       if (x > maxX) maxX = x;
@@ -1614,6 +2046,24 @@ function fitAreaToAlpha(frame, side, rect, center) {
     return normalizeRect(frame, { x: normalized.x, y: bounds.y, w: normalized.w, h: bounds.h }, 1);
   }
   return normalizeRect(frame, { x: bounds.x, y: normalized.y, w: bounds.w, h: normalized.h }, 1);
+}
+
+function expandAreaToAlphaSupport(frame, side, rect, center) {
+  const normalized = normalizeRect(frame, rect, 1);
+  const region = getSideSearchRegion(frame, side, center);
+  const search = side === "top" || side === "bottom"
+    ? { x: normalized.x, y: region.y, w: normalized.w, h: region.h }
+    : { x: region.x, y: normalized.y, w: region.w, h: normalized.h };
+  const bounds = alphaBoundsInRect(frame, search, 0);
+  if (!bounds) return normalized;
+  if (side === "top" || side === "bottom") {
+    const start = Math.min(normalized.y, bounds.y);
+    const end = Math.max(rectEndY(normalized), rectEndY(bounds));
+    return normalizeRect(frame, { x: normalized.x, y: start, w: normalized.w, h: end - start }, 1);
+  }
+  const start = Math.min(normalized.x, bounds.x);
+  const end = Math.max(rectEndX(normalized), rectEndX(bounds));
+  return normalizeRect(frame, { x: start, y: normalized.y, w: end - start, h: normalized.h }, 1);
 }
 
 function detectMedallions(frame, areas) {
@@ -1649,6 +2099,174 @@ function detectSideMedallion(frame, side, areas) {
   const cross = horizontal ? bounds.h : bounds.w;
   if (primary < minPrimary || cross < 3) return null;
   return bounds;
+}
+
+function wizardMedallionSettings(config = null) {
+  const limited = config?.limitMedallions ?? state.wizard.limitMedallions;
+  const requested = config?.maxMedallions ?? state.wizard.maxMedallions;
+  return {
+    limited: Boolean(limited),
+    max: clamp(Math.round(Number(requested) || 0), 0, 6),
+  };
+}
+
+// Find multiple high-mass features along a side. The older detector only looked
+// for one feature near the exact centre, while wizard candidates normally reduce
+// their tile runs to one span—so buildSliceScanFixedRuns() had no internal gaps
+// and the wizard usually produced no medallions at all.
+function detectWizardSideMedallions(frame, side, areas, settings) {
+  const area = areas[side];
+  if (!area) return [];
+  const axis = sideAxis(side);
+  const areaStart = Math.round(rectPrimaryStart(area, axis));
+  const areaEnd = Math.round(rectPrimaryEnd(area, axis));
+  const span = Math.max(0, areaEnd - areaStart);
+  if (span < 3) return [];
+  const region = getSideSearchRegion(frame, side, areas.center);
+  const counts = projectAlphaCounts(frame, region, axis);
+  const smooth = smoothCounts(counts, 2);
+  const values = smooth.slice(areaStart, areaEnd);
+  if (values.length === 0 || Math.max(...values) <= 0) return [];
+  const positive = values.filter((value) => value > 0);
+  const baseline = percentileOf(positive.length > 0 ? positive : values, 0.5);
+  const requestedLimit = settings.limited
+    ? settings.max
+    : Math.min(4, getMaxMedallionsPerSide(frame));
+  if (requestedLimit <= 0) return [];
+
+  const minimumWidth = Math.max(3, Math.round(span * 0.025));
+  const separation = Math.max(minimumWidth + 2, Math.round(span / Math.max(8, requestedLimit * 3)));
+  const middle = (areaStart + areaEnd) / 2;
+  const ranked = [];
+  for (let index = areaStart; index < areaEnd; index += 1) {
+    const value = smooth[index] || 0;
+    const previous = smooth[index - 1] ?? value;
+    const next = smooth[index + 1] ?? value;
+    if (value >= previous && value >= next && value > 0) {
+      ranked.push({ index, value, prominence: value - baseline });
+    }
+  }
+  ranked.sort((a, b) => (
+    b.prominence - a.prominence
+    || b.value - a.value
+    || Math.abs(a.index - middle) - Math.abs(b.index - middle)
+  ));
+
+  const chosen = [];
+  const chooseWithSeparation = (minDistance) => {
+    for (const peak of ranked) {
+      if (chosen.length >= requestedLimit) break;
+      if (chosen.some((other) => Math.abs(other.index - peak.index) < minDistance)) continue;
+      if (peak.value < Math.max(baseline + 1.5, baseline * 1.22)) continue;
+      chosen.push(peak);
+    }
+  };
+  chooseWithSeparation(separation);
+
+  const candidates = [];
+  for (const peak of chosen) {
+    const bandThreshold = baseline + Math.max(0.75, peak.prominence * 0.35);
+    const maxWidth = Math.max(minimumWidth, Math.floor(span / Math.max(2, requestedLimit * 1.5)));
+    let start = peak.index;
+    let end = peak.index + 1;
+    while (start > areaStart && smooth[start - 1] >= bandThreshold && end - start < maxWidth) start -= 1;
+    while (end < areaEnd && smooth[end] >= bandThreshold && end - start < maxWidth) end += 1;
+    if (end - start < minimumWidth) {
+      const missing = minimumWidth - (end - start);
+      start = clamp(start - Math.ceil(missing / 2), areaStart, areaEnd - minimumWidth);
+      end = Math.min(areaEnd, start + minimumWidth);
+    }
+    const search = axis === "x"
+      ? { x: start, y: region.y, w: end - start, h: region.h }
+      : { x: region.x, y: start, w: region.w, h: end - start };
+    const bounds = alphaBoundsInRect(frame, search, 0);
+    if (!bounds) continue;
+    const expanded = expandRunFullCross(frame, side, bounds, areas.center);
+    const clipped = rectIntersection(expanded, area);
+    if (clipped && clipped.w > 0 && clipped.h > 0) candidates.push(clipped);
+  }
+  return mergeFixedRunsForArea(candidates, axis)
+    .sort((a, b) => rectPrimaryStart(a, axis) - rectPrimaryStart(b, axis))
+    .slice(0, requestedLimit);
+}
+
+function restoreWizardTileCoverage(area, originalRuns, fixedRuns, axis) {
+  if (originalRuns.length === 0) return [];
+  const start = Math.round(rectPrimaryStart(area, axis));
+  const end = Math.round(rectPrimaryEnd(area, axis));
+  const length = Math.max(1, end - start);
+  const blocked = new Uint8Array(length);
+  const selected = new Uint8Array(length);
+  const mark = (mask, rect) => {
+    const from = clamp(Math.round(rectPrimaryStart(rect, axis)) - start, 0, length);
+    const to = clamp(Math.round(rectPrimaryEnd(rect, axis)) - start, from, length);
+    for (let index = from; index < to; index += 1) mask[index] = 1;
+  };
+  fixedRuns.forEach((rect) => mark(blocked, rect));
+  originalRuns.forEach((rect) => mark(selected, rect));
+  let target = selected.reduce((sum, value) => sum + value, 0);
+  let selectedCount = 0;
+  for (let index = 0; index < length; index += 1) {
+    if (blocked[index]) selected[index] = 0;
+    selectedCount += selected[index];
+  }
+  const available = length - blocked.reduce((sum, value) => sum + value, 0);
+  target = Math.min(target, available);
+  if (selectedCount < target) {
+    const distanceToOriginal = (index) => originalRuns.reduce((best, rect) => {
+      const runStart = Math.round(rectPrimaryStart(rect, axis)) - start;
+      const runEnd = Math.round(rectPrimaryEnd(rect, axis)) - start;
+      const distance = index < runStart ? runStart - index : index >= runEnd ? index - runEnd + 1 : 0;
+      return Math.min(best, distance);
+    }, Number.POSITIVE_INFINITY);
+    const fill = Array.from({ length }, (_, index) => index)
+      .filter((index) => !blocked[index] && !selected[index])
+      .sort((a, b) => distanceToOriginal(a) - distanceToOriginal(b));
+    for (const index of fill) {
+      if (selectedCount >= target) break;
+      selected[index] = 1;
+      selectedCount += 1;
+    }
+  }
+  const runs = [];
+  let runStart = null;
+  for (let index = 0; index <= length; index += 1) {
+    if (index < length && selected[index]) {
+      if (runStart === null) runStart = index;
+    } else if (runStart !== null) {
+      runs.push(rectFromPrimarySpan(area, axis, start + runStart, start + index));
+      runStart = null;
+    }
+  }
+  return runs;
+}
+
+function applyWizardMedallions(frame, sourceAreas, config) {
+  const areas = cloneAreas(sourceAreas);
+  const settings = wizardMedallionSettings(config);
+  const fixedRuns = {};
+  const tileRuns = {};
+  for (const side of EDGE_SIDES) {
+    const area = areas[side];
+    const axis = sideAxis(side);
+    const detected = detectWizardSideMedallions(frame, side, areas, settings);
+    const existing = areas.fixedRuns?.[side] || [];
+    let fixed = mergeFixedRunsForArea([...existing, ...detected], axis);
+    const maximum = settings.limited ? settings.max : getMaxMedallionsPerSide(frame);
+    fixed = limitFixedRunsCount(fixed, axis, maximum);
+    if (fixed.length > 0) fixedRuns[side] = fixed;
+    const originalTiles = areas.tileRuns?.[side] || [];
+    const restoredTiles = restoreWizardTileCoverage(area, originalTiles, fixed, axis);
+    if (restoredTiles.length > 0) tileRuns[side] = restoredTiles.map((rect) => expandRunFullCross(frame, side, rect, areas.center));
+  }
+  areas.tileRuns = Object.keys(tileRuns).length > 0 ? tileRuns : null;
+  areas.fixedRuns = Object.keys(fixedRuns).length > 0 ? fixedRuns : null;
+  // An enabled 0 maximum must remain authoritative through constrainEdgeAreas;
+  // otherwise its gap-based fallback would immediately recreate fixed runs.
+  areas.fixedRunsExplicit = settings.limited || Object.keys(fixedRuns).length > 0;
+  delete areas.fixedRunsExplicitSides;
+  areas.medallions = representativeFixedMedallions(fixedRuns, areas);
+  return constrainEdgeAreas(frame, areas);
 }
 
 function projectAlphaCounts(frame, rect, axis) {
@@ -1708,6 +2326,10 @@ function constrainEdgeAreas(frame, areas) {
     left: normalizeRect(frame, areas.left || sideDefaultRect(frame, center, "left"), 1),
     right: normalizeRect(frame, areas.right || sideDefaultRect(frame, center, "right"), 1),
   };
+  const sideModes = cloneSideModes(areas.sideModes);
+  if (sideModes) constrained.sideModes = sideModes;
+  const hiddenMedallionSides = cloneSideFlags(areas.hiddenMedallionSides);
+  if (hiddenMedallionSides) constrained.hiddenMedallionSides = hiddenMedallionSides;
   if (areas.fixedRunsExplicit === true) constrained.fixedRunsExplicit = true;
   const explicitFixedSides = areas.fixedRunsExplicitSides || {};
   const constrainedExplicitFixedSides = {};
@@ -1729,10 +2351,11 @@ function constrainEdgeAreas(frame, areas) {
   const fixedRuns = {};
   for (const side of ["top", "bottom", "left", "right"]) {
     const axis = sideAxis(side);
-    const useExplicitFixedRuns = areas.fixedRunsExplicit === true || explicitFixedSides[side] === true;
-    if (explicitFixedSides[side] === true) constrainedExplicitFixedSides[side] = true;
+    const medallionsHidden = hiddenMedallionSides?.[side] === true;
+    const useExplicitFixedRuns = medallionsHidden || areas.fixedRunsExplicit === true || explicitFixedSides[side] === true;
+    if (medallionsHidden || explicitFixedSides[side] === true) constrainedExplicitFixedSides[side] = true;
     const gapRuns = fixedRunsForTileGaps(constrained[side], tileRuns[side] || [], axis);
-    const sourceRuns = [
+    const sourceRuns = medallionsHidden ? [] : [
       ...(sourceFixedRuns[side] || []),
       ...(sourceMedallions[side] ? [sourceMedallions[side]] : []),
     ];
@@ -1742,7 +2365,10 @@ function constrainEdgeAreas(frame, areas) {
           .filter((rect) => rect && rect.w > 0 && rect.h > 0)
       : gapRuns;
     const clippedRuns = removeFixedRunTileOverlaps(normalizedRuns, tileRuns[side] || [], axis);
-    const mergedRuns = mergeFixedRunsForArea(clippedRuns, axis);
+    let mergedRuns = mergeFixedRunsForArea(clippedRuns, axis);
+    if (!useExplicitFixedRuns) {
+      mergedRuns = limitFixedRunsCount(mergedRuns, axis, getMaxMedallionsPerSide(frame));
+    }
     if (mergedRuns.length > 0) fixedRuns[side] = mergedRuns;
   }
   if (Object.keys(constrainedExplicitFixedSides).length > 0) constrained.fixedRunsExplicitSides = constrainedExplicitFixedSides;
@@ -1851,7 +2477,7 @@ function createSliceScanSuggestion(frame) {
     right: sideAreaFromSliceScan(frame, center, "right", scans.right),
   };
 
-  areas.tileRuns = buildSliceScanTileRuns(areas, scans);
+  areas.tileRuns = buildSliceScanTileRuns(frame, areas, scans);
   areas.fixedRuns = buildSliceScanFixedRuns(areas);
   areas.medallions = representativeFixedMedallions(areas.fixedRuns, areas);
 
@@ -2161,7 +2787,10 @@ function sideAreaFromSliceScan(frame, center, side, scan) {
     const w = crossSize ?? Math.max(1, frame.w - centerRight);
     rect = { x: cross ? frame.w - cross.end : centerRight, y: support.start, w, h: support.end - support.start };
   }
-  return normalizeRect(frame, rect, 1);
+  // The median cross span is a useful starting point, but not a safe crop:
+  // uncommon protrusions (especially medallions) can sit outside it. Expand to
+  // the union of every visible pixel on the selected part of this side.
+  return expandAreaToAlphaSupport(frame, side, rect, center);
 }
 
 function selectSideAreaSupport(scan) {
@@ -2307,7 +2936,7 @@ function drawableSpan(scan, drawable = scan.drawable) {
   return start === null ? null : { start, end };
 }
 
-function buildSliceScanTileRuns(areas, scans) {
+function buildSliceScanTileRuns(frame, areas, scans) {
   const tileRuns = {};
   for (const side of ["top", "bottom", "left", "right"]) {
     const scan = scans[side];
@@ -2331,7 +2960,8 @@ function buildSliceScanTileRuns(areas, scans) {
         end: clamp(fallback.end, areaStart, areaEnd),
       }].filter((run) => run.end > run.start);
     }
-    const runs = primaryRuns.map((run) => rectFromPrimarySpan(area, axis, run.start, run.end));
+    const runs = primaryRuns.map((run) =>
+      expandRunFullCross(frame, side, rectFromPrimarySpan(area, axis, run.start, run.end), areas.center));
     if (runs.length > 0) tileRuns[side] = runs;
   }
   return tileRuns;
@@ -2436,8 +3066,12 @@ function representativeFixedMedallions(fixedRuns, areas) {
 
 function patchFromSliceScanAreas(frame, areas) {
   const center = areas.center;
-  const horizontalFeature = areas.medallions?.top || areas.medallions?.bottom || null;
-  const verticalFeature = areas.medallions?.left || areas.medallions?.right || null;
+  const horizontalFeature = (areas.hiddenMedallionSides?.top ? null : areas.medallions?.top)
+    || (areas.hiddenMedallionSides?.bottom ? null : areas.medallions?.bottom)
+    || null;
+  const verticalFeature = (areas.hiddenMedallionSides?.left ? null : areas.medallions?.left)
+    || (areas.hiddenMedallionSides?.right ? null : areas.medallions?.right)
+    || null;
   const xBand = axisFeatureBand(center.x, rectEndX(center), horizontalFeature, "x");
   const yBand = axisFeatureBand(center.y, rectEndY(center), verticalFeature, "y");
   return {
@@ -2765,6 +3399,9 @@ function drawEditor() {
   drawTileRuns(editorCtx, areas.tileRuns || {});
   drawFixedRuns(editorCtx, areas.fixedRuns || {}, areas.medallions || {});
   drawSelectedSliceOutline(editorCtx);
+  if (els.showInsideRect?.checked) {
+    drawInsideRectOverlay(editorCtx, findInsideRect(frame, findInteriorTransparentBounds(frame)));
+  }
   editorCtx.restore();
   editorCtx.restore();
 
@@ -2791,6 +3428,21 @@ function sideHasTileRuns(areas, side) {
   return (areas.tileRuns?.[side] || []).length > 0;
 }
 
+// Read-only overlay for the computed inside/content rect (no resize handles).
+function drawInsideRectOverlay(ctx, rect) {
+  if (!rect || rect.w <= 0 || rect.h <= 0) return;
+  ctx.save();
+  ctx.strokeStyle = "#4fd0e0";
+  ctx.fillStyle = "#4fd0e0";
+  ctx.setLineDash([4, 4]);
+  ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, Math.max(0, rect.w - 1), Math.max(0, rect.h - 1));
+  ctx.globalAlpha = 0.1;
+  ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+  ctx.globalAlpha = 1;
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
 function drawAreaRect(ctx, rect, color, dash, label) {
   if (rect.w <= 0 || rect.h <= 0) return;
   ctx.save();
@@ -2801,9 +3453,6 @@ function drawAreaRect(ctx, rect, color, dash, label) {
   ctx.globalAlpha = 0.15;
   ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
   ctx.globalAlpha = 1;
-  ctx.font = "10px system-ui, sans-serif";
-  ctx.textBaseline = "top";
-  ctx.fillText(label, rect.x + 3, rect.y + 3);
   drawAreaResizeHandles(ctx, rect, label);
   ctx.restore();
 }
@@ -2859,7 +3508,6 @@ function drawSelectedSliceOutline(ctx) {
   ctx.lineWidth = onePixelLine(ctx);
   ctx.strokeStyle = "#eef2e4";
   ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, Math.max(0, rect.w - 1), Math.max(0, rect.h - 1));
-  if (selected.kind === "slice") drawRectEdgeHandles(ctx, rect);
   ctx.restore();
 }
 
@@ -2885,12 +3533,8 @@ function drawFixedRuns(ctx, fixedRuns, medallions) {
 
 function drawEditableRunRect(ctx, side, rect, label, handles = true, labelColor = "#eef2e4") {
   if (!rect || rect.w <= 0 || rect.h <= 0) return;
-  const runFill = ctx.fillStyle;
   ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, Math.max(0, rect.w - 1), Math.max(0, rect.h - 1));
   ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
-  ctx.fillStyle = labelColor;
-  ctx.fillText(label, rect.x + 3, rect.y + 3);
-  ctx.fillStyle = runFill;
   if (handles) drawEditableRunResizeHandles(ctx, side, rect);
 }
 
@@ -2907,17 +3551,6 @@ function drawEditableRunResizeHandles(ctx, side, rect) {
   }
   ctx.restore();
   ctx.setLineDash(previousDash);
-}
-
-function drawRectEdgeHandles(ctx, rect) {
-  ctx.save();
-  ctx.fillStyle = "#eef2e4";
-  ctx.strokeStyle = "#10130e";
-  for (const handle of getRectEdgeHandlePoints(rect)) {
-    ctx.fillRect(handle.x - 3, handle.y - 3, 7, 7);
-    ctx.strokeRect(handle.x - 3.5, handle.y - 3.5, 8, 8);
-  }
-  ctx.restore();
 }
 
 function drawMedallions(ctx, medallions) {
@@ -3144,6 +3777,1512 @@ function renderGridView() {
   }
 }
 
+const WIZARD_STRATEGY_LABELS = {
+  stable: "Stable runs",
+  seam: "Seam-optimized chunk",
+  largest: "Largest repeat",
+  centered: "Centered repeat",
+  merged: "Long merged chunk",
+  whole: "Whole rail",
+};
+
+const WIZARD_MODE_LABELS = {
+  tile: "Tile",
+  tile_stretch: "Tile + stretch",
+  mirror: "Mirror",
+  stretch: "Stretch",
+};
+
+const WIZARD_RECIPES = [
+  { name: "Current settings", threshold: 70, bridge: 20, corner: 12, length: 2, strategy: "stable", scale: 1, mode: "tile_stretch", current: true },
+  { name: "Clean repeats", threshold: 48, bridge: 8, corner: 16, length: 1, strategy: "seam", scale: 1, mode: "tile" },
+  { name: "Long vine loop", threshold: 94, bridge: 44, corner: 8, length: 5, strategy: "merged", scale: 1.12, mode: "tile" },
+  { name: "Largest clean chunk", threshold: 58, bridge: 18, corner: 14, length: 2, strategy: "seam", scale: 1.6, mode: "tile" },
+  { name: "Centered ornament", threshold: 64, bridge: 10, corner: 18, length: 2, strategy: "centered", scale: 1.35, mode: "mirror" },
+  { name: "Gentle hybrid", threshold: 76, bridge: 24, corner: 12, length: 3, strategy: "stable", scale: 1.25, mode: "tile_stretch" },
+  { name: "Strict mirror", threshold: 38, bridge: 4, corner: 20, length: 1, strategy: "largest", scale: 1.05, mode: "mirror" },
+  { name: "Broad rails", threshold: 112, bridge: 55, corner: 6, length: 7, strategy: "merged", scale: 1.35, mode: "tile_stretch" },
+  { name: "Whole motif", threshold: 82, bridge: 34, corner: 10, length: 4, strategy: "whole", scale: 0.9, mode: "tile" },
+  { name: "Compact repeat", threshold: 44, bridge: 6, corner: 22, length: 1, strategy: "largest", scale: 0.72, mode: "tile" },
+  { name: "Loose foliage", threshold: 124, bridge: 62, corner: 5, length: 9, strategy: "merged", scale: 1.6, mode: "tile_stretch" },
+  { name: "Centered hybrid", threshold: 72, bridge: 16, corner: 16, length: 3, strategy: "centered", scale: 1.75, mode: "tile_stretch" },
+  { name: "Many small runs", threshold: 34, bridge: 2, corner: 12, length: 0, strategy: "stable", scale: 0.82, mode: "tile" },
+  { name: "Mirrored vine", threshold: 88, bridge: 36, corner: 9, length: 5, strategy: "largest", scale: 1.9, mode: "mirror" },
+  { name: "Decorated rail", threshold: 104, bridge: 48, corner: 7, length: 6, strategy: "whole", scale: 1, mode: "tile_stretch" },
+];
+
+const WIZARD_LONG_STRATEGIES = [
+  "seam", "seam", "largest", "merged", "seam",
+  "whole", "largest", "seam", "merged", "centered",
+  "seam", "whole", "largest", "merged", "seam",
+];
+
+const WIZARD_LONG_SCALES = [
+  1.55, 1.7, 1.85, 2, 2.15,
+  2.3, 2.45, 2.6, 2.8, 3,
+  3.2, 3.4, 3.6, 3.8, 4,
+];
+
+const WIZARD_LONG_MODES = [
+  "tile", "tile_stretch", "mirror", "tile", "tile_stretch",
+  "tile", "mirror", "tile_stretch", "tile", "mirror",
+  "tile_stretch", "tile", "mirror", "tile_stretch", "tile",
+];
+
+const WIZARD_LONG_RECIPES = WIZARD_RECIPES.map((recipe, index) => ({
+  ...recipe,
+  name: `Long ${index + 1}`,
+  strategy: WIZARD_LONG_STRATEGIES[index],
+  scale: Math.max(WIZARD_LONG_SCALES[index], recipe.scale * 1.45),
+  minRunRatio: 0.3,
+  mode: WIZARD_LONG_MODES[index],
+  current: false,
+  long: true,
+  autoInpaintPreset: "patchStrong",
+}));
+
+function currentWizardConfig() {
+  return {
+    name: "Current settings",
+    threshold: Number(els.sliceThreshold?.value || 70),
+    bridge: Number(els.sliceBridgeGap?.value || 20),
+    corner: Number(els.sliceCornerGuard?.value || 12),
+    length: Number(els.sliceLengthLimit?.value || 2),
+    strategy: "stable",
+    scale: 1,
+    mode: state.previewMode,
+    current: true,
+  };
+}
+
+function withWizardScanSettings(config, callback) {
+  const inputs = [
+    [els.sliceThreshold, config.threshold],
+    [els.sliceBridgeGap, config.bridge],
+    [els.sliceCornerGuard, config.corner],
+    [els.sliceLengthLimit, config.length],
+  ];
+  const previous = inputs.map(([input]) => input?.value);
+  try {
+    inputs.forEach(([input, value]) => {
+      if (input) input.value = String(value);
+    });
+    return callback();
+  } finally {
+    inputs.forEach(([input], index) => {
+      if (input && previous[index] !== undefined) input.value = previous[index];
+    });
+  }
+}
+
+function wizardPrimaryRun(area, axis, start, end, scale) {
+  const areaStart = rectPrimaryStart(area, axis);
+  const areaEnd = rectPrimaryEnd(area, axis);
+  const center = (start + end) / 2;
+  const half = Math.max(0.5, (end - start) * scale / 2);
+  let scaledStart = Math.round(center - half);
+  let scaledEnd = Math.round(center + half);
+  if (scaledStart < areaStart) {
+    scaledEnd += areaStart - scaledStart;
+    scaledStart = areaStart;
+  }
+  if (scaledEnd > areaEnd) {
+    scaledStart -= scaledEnd - areaEnd;
+    scaledEnd = areaEnd;
+  }
+  scaledStart = clamp(scaledStart, areaStart, Math.max(areaStart, areaEnd - 1));
+  scaledEnd = clamp(scaledEnd, scaledStart + 1, areaEnd);
+  return { start: scaledStart, end: scaledEnd };
+}
+
+function sizeAndPositionWizardRun(area, axis, run, minRatio = 0, targetRatio = null, position = null) {
+  const areaStart = rectPrimaryStart(area, axis);
+  const areaEnd = rectPrimaryEnd(area, axis);
+  const areaLength = Math.max(1, areaEnd - areaStart);
+  const minimum = clamp(Math.floor(areaLength * minRatio) + 1, 1, areaLength);
+  const requested = targetRatio === null
+    ? Math.max(minimum, run.end - run.start)
+    : clamp(Math.round(areaLength * clamp(targetRatio, minRatio, 1)), minimum, areaLength);
+  const center = (run.start + run.end) / 2;
+  let start = position === null
+    ? Math.round(center - requested / 2)
+    : areaStart + Math.round(clamp(position, 0, 1) * Math.max(0, areaLength - requested));
+  let end = start + requested;
+  if (start < areaStart) {
+    end += areaStart - start;
+    start = areaStart;
+  }
+  if (end > areaEnd) {
+    start -= end - areaEnd;
+    end = areaEnd;
+  }
+  return { start: Math.max(areaStart, start), end: Math.min(areaEnd, end) };
+}
+
+function mergeWizardPrimaryRuns(runs) {
+  const merged = [];
+  for (const run of [...runs].sort((a, b) => a.start - b.start)) {
+    const previous = merged[merged.length - 1];
+    if (previous && run.start <= previous.end) previous.end = Math.max(previous.end, run.end);
+    else merged.push({ ...run });
+  }
+  return merged;
+}
+
+function findWizardSeamRun(area, axis, scan, config, fixedRuns = []) {
+  if (!scan?.profiles?.length) return null;
+  const areaStart = clamp(rectPrimaryStart(area, axis), scan.validStart, Math.max(scan.validStart, scan.validEnd - 1));
+  const areaEnd = clamp(rectPrimaryEnd(area, axis), areaStart + 1, scan.validEnd);
+  const span = areaEnd - areaStart;
+  if (span < 4) return null;
+  const target = clamp(Math.round(span * clamp(0.28 * (config.scale || 1), 0.18, 0.82)), 3, span);
+  const minLength = clamp(Math.round(target * 0.58), 3, target);
+  const maxLength = clamp(Math.round(target * 1.55), minLength, span);
+  const step = span > 180 ? 2 : 1;
+  const alphaThreshold = Number(els.alphaThreshold.value);
+  let best = null;
+  for (let start = areaStart; start <= areaEnd - minLength; start += step) {
+    if ((scan.mass?.[start] || 0) < (scan.supportMassFloor || 0)) continue;
+    for (let length = minLength; length <= maxLength && start + length <= areaEnd; length += step) {
+      const end = start + length;
+      if ((scan.mass?.[end - 1] || 0) < (scan.supportMassFloor || 0)) continue;
+      const comparison = compareSliceProfiles(scan.profiles[start], scan.profiles[end - 1], alphaThreshold);
+      if (!Number.isFinite(comparison.score)) continue;
+      const targetPenalty = Math.abs(length - target) / span * 9;
+      const sizeReward = length / span * 1.5;
+      const fixedOverlap = fixedRuns.reduce((sum, rect) => {
+        const overlapStart = Math.max(start, rectPrimaryStart(rect, axis));
+        const overlapEnd = Math.min(end, rectPrimaryEnd(rect, axis));
+        return sum + Math.max(0, overlapEnd - overlapStart);
+      }, 0);
+      const medallionPenalty = fixedOverlap / length * 24;
+      const score = comparison.score + targetPenalty + medallionPenalty - sizeReward;
+      if (!best || score < best.score) best = { start, end, score };
+    }
+  }
+  return best ? { start: best.start, end: best.end } : null;
+}
+
+function tuneWizardAreas(frame, sourceAreas, config, scans = null) {
+  const areas = cloneAreas(sourceAreas);
+  areas.tileRuns ||= {};
+  for (const side of EDGE_SIDES) {
+    const area = areas[side];
+    if (!area) continue;
+    const axis = sideAxis(side);
+    const areaStart = rectPrimaryStart(area, axis);
+    const areaEnd = rectPrimaryEnd(area, axis);
+    let primaryRuns = (areas.tileRuns[side] || []).map((rect) => ({
+      start: rectPrimaryStart(rect, axis),
+      end: rectPrimaryEnd(rect, axis),
+    })).filter((run) => run.end > run.start);
+    if (primaryRuns.length === 0) primaryRuns = [{ start: areaStart, end: areaEnd }];
+
+    if (config.strategy === "seam") {
+      const seamRun = findWizardSeamRun(area, axis, scans?.[side], config, areas.fixedRuns?.[side] || []);
+      if (seamRun) primaryRuns = [seamRun];
+    } else if (config.strategy === "largest") {
+      primaryRuns = [primaryRuns.sort((a, b) => (b.end - b.start) - (a.end - a.start))[0]];
+    } else if (config.strategy === "centered") {
+      const middle = (areaStart + areaEnd) / 2;
+      primaryRuns = [primaryRuns.sort((a, b) =>
+        Math.abs((a.start + a.end) / 2 - middle) - Math.abs((b.start + b.end) / 2 - middle))[0]];
+    } else if (config.strategy === "merged") {
+      primaryRuns = [{
+        start: Math.min(...primaryRuns.map((run) => run.start)),
+        end: Math.max(...primaryRuns.map((run) => run.end)),
+      }];
+    } else if (config.strategy === "whole") {
+      primaryRuns = [{ start: areaStart, end: areaEnd }];
+    }
+
+    const runScale = config.strategy === "seam" ? 1 : (config.scale || 1);
+    const scaledRuns = mergeWizardPrimaryRuns(primaryRuns.map((run) =>
+      sizeAndPositionWizardRun(
+        area,
+        axis,
+        wizardPrimaryRun(area, axis, run.start, run.end, runScale),
+        config.minRunRatio || 0,
+        config.targetRunRatio ?? null,
+        config.runPositions?.[side] ?? null,
+      )));
+    areas.tileRuns[side] = scaledRuns.map((run) =>
+      expandRunFullCross(frame, side, rectFromPrimarySpan(area, axis, run.start, run.end), areas.center));
+  }
+  areas.fixedRuns = buildSliceScanFixedRuns(areas);
+  areas.medallions = representativeFixedMedallions(areas.fixedRuns, areas);
+  delete areas.fixedRunsExplicit;
+  delete areas.fixedRunsExplicitSides;
+  return constrainEdgeAreas(frame, areas);
+}
+
+function createWizardAreas(frame, config) {
+  const previousScan = state.sliceScans.get(frame.id);
+  const result = withWizardScanSettings(config, () => createSliceScanSuggestion(frame));
+  if (previousScan) state.sliceScans.set(frame.id, previousScan);
+  else state.sliceScans.delete(frame.id);
+  const base = result?.areas || state.edgeAreas.get(frame.id) || suggestEdgeAreas(frame);
+  return tuneWizardAreas(frame, base, config, result?.scans);
+}
+
+function scoreWizardAreas(frame, areas) {
+  if (!state.originalData) return { seam: 0, coverage: 0, chunk: 0 };
+  const alphaThreshold = Number(els.alphaThreshold.value);
+  const scores = [];
+  let repeated = 0;
+  let available = 0;
+  let largest = 0;
+  for (const side of EDGE_SIDES) {
+    const area = areas[side];
+    if (!area) continue;
+    const axis = sideAxis(side);
+    available += Math.max(1, rectPrimaryEnd(area, axis) - rectPrimaryStart(area, axis));
+    const thickness = sideCrossThickness(frame, areas.center, side);
+    for (const rect of areas.tileRuns?.[side] || []) {
+      const start = clamp(rectPrimaryStart(rect, axis), 0, sidePrimaryLength(frame, side) - 1);
+      const end = clamp(rectPrimaryEnd(rect, axis) - 1, start, sidePrimaryLength(frame, side) - 1);
+      const length = end - start + 1;
+      repeated += length;
+      largest = Math.max(largest, length);
+      const first = makeSideSliceProfile(frame, areas.center, side, start, thickness, state.originalData.width, state.originalData.data);
+      const last = makeSideSliceProfile(frame, areas.center, side, end, thickness, state.originalData.width, state.originalData.data);
+      const comparison = compareSliceProfiles(first.profile, last.profile, alphaThreshold);
+      if (Number.isFinite(comparison.score)) scores.push(comparison.score);
+    }
+  }
+  const mismatch = scores.length > 0 ? scores.reduce((sum, value) => sum + value, 0) / scores.length : 100;
+  return {
+    seam: clamp(Math.round(100 - mismatch * 2), 0, 100),
+    coverage: clamp(Math.round(repeated / Math.max(1, available) * 100), 0, 100),
+    chunk: largest,
+  };
+}
+
+function makeWizardCandidate(frame, config, areasOverride = null) {
+  const resolvedConfig = {
+    ...config,
+    limitMedallions: config.limitMedallions ?? state.wizard.limitMedallions,
+    maxMedallions: config.maxMedallions ?? state.wizard.maxMedallions,
+  };
+  const baseAreas = areasOverride ? cloneAreas(areasOverride) : createWizardAreas(frame, resolvedConfig);
+  const areas = applyWizardMedallions(frame, baseAreas, resolvedConfig);
+  return {
+    id: ++state.wizard.serial,
+    config: resolvedConfig,
+    baseAreas: cloneAreas(baseAreas),
+    areas,
+    patch: constrainPatch(frame, patchFromSliceScanAreas(frame, areas)),
+    metrics: scoreWizardAreas(frame, areas),
+    inpaintStatus: resolvedConfig.autoInpaintPreset ? "idle" : "none",
+    inpaintError: "",
+    inpaintPromise: null,
+    previewPatches: new Map(),
+    previewSourceCanvas: null,
+    previewCanvas: null,
+  };
+}
+
+function jitterWizardConfig(config, amount = 1) {
+  const jitter = (range) => (Math.random() * 2 - 1) * range * amount;
+  const strategies = Object.keys(WIZARD_STRATEGY_LABELS);
+  const modes = ["tile", "tile", "tile_stretch", "tile_stretch", "mirror", "stretch"];
+  const minScale = config.long ? 1.5 : 0.55;
+  const maxScale = config.long ? 4.5 : 2.6;
+  return {
+    ...config,
+    name: config.name,
+    threshold: Math.round(clamp(config.threshold + jitter(24), 5, 160)),
+    bridge: Math.round(clamp(config.bridge + jitter(18), 0, 80)),
+    corner: Math.round(clamp(config.corner + jitter(8), 0, 40)),
+    length: Math.round(clamp(config.length + jitter(4), 0, 20)),
+    scale: Math.round(clamp(config.scale * (1 + jitter(0.35)), minScale, maxScale) * 100) / 100,
+    strategy: Math.random() < 0.22 ? strategies[Math.floor(Math.random() * strategies.length)] : config.strategy,
+    mode: Math.random() < 0.22 ? modes[Math.floor(Math.random() * modes.length)] : config.mode,
+    current: false,
+  };
+}
+
+function crossoverWizardConfig(parents, index) {
+  const a = parents[Math.floor(Math.random() * parents.length)].config;
+  const b = parents[Math.floor(Math.random() * parents.length)].config;
+  const mix = 0.25 + Math.random() * 0.5;
+  const long = Boolean(a.long || b.long);
+  return jitterWizardConfig({
+    name: `Mutation ${index + 1}`,
+    threshold: a.threshold * mix + b.threshold * (1 - mix),
+    bridge: a.bridge * mix + b.bridge * (1 - mix),
+    corner: a.corner * mix + b.corner * (1 - mix),
+    length: a.length * mix + b.length * (1 - mix),
+    scale: a.scale * mix + b.scale * (1 - mix),
+    minRunRatio: long ? 0.3 : 0,
+    targetRunRatio: long ? Math.round((0.3 + Math.random() * 0.7) * 100) / 100 : null,
+    runPositions: long ? Object.fromEntries(EDGE_SIDES.map((side) => [side, Math.random()])) : null,
+    strategy: Math.random() < 0.5 ? a.strategy : b.strategy,
+    mode: Math.random() < 0.5 ? a.mode : b.mode,
+    long,
+    autoInpaintPreset: long ? (a.autoInpaintPreset || b.autoInpaintPreset || "patchStrong") : null,
+    inpaintInsidePx: long ? 1 + Math.floor(Math.random() * 12) : null,
+    inpaintOutsidePx: long ? Math.floor(Math.random() * 7) : null,
+  }, 0.72);
+}
+
+function makeFreshWizardCandidates(frame) {
+  const current = currentWizardConfig();
+  return WIZARD_RECIPES.map((recipe, index) => {
+    let config = recipe.current ? current : { ...recipe };
+    if (state.wizard.generation > 0) config = jitterWizardConfig(config, 0.9);
+    config.name = state.wizard.generation === 0 ? recipe.name : `Fresh ${index + 1}`;
+    const currentAreas = recipe.current && state.wizard.generation === 0 ? state.edgeAreas.get(frame.id) : null;
+    return makeWizardCandidate(frame, config, currentAreas);
+  });
+}
+
+function shuffledLongRunRatios(count) {
+  // Sample once inside every equal slice of the 30–100% range, then shuffle
+  // the results into grid order. This keeps every card random while preventing
+  // an unlucky Long 15 from clustering at nearly identical lengths.
+  const ratios = Array.from({ length: count }, (_, index) => {
+    const firstPercent = 30 + Math.floor(index * 71 / count);
+    const lastPercent = index === count - 1
+      ? 100
+      : 29 + Math.floor((index + 1) * 71 / count);
+    return (firstPercent + Math.floor(Math.random() * (lastPercent - firstPercent + 1))) / 100;
+  });
+  for (let index = ratios.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [ratios[index], ratios[swapIndex]] = [ratios[swapIndex], ratios[index]];
+  }
+  return ratios;
+}
+
+function makeLongWizardCandidates(frame) {
+  const targetRatios = shuffledLongRunRatios(WIZARD_LONG_RECIPES.length);
+  return WIZARD_LONG_RECIPES.map((recipe, index) => {
+    const config = jitterWizardConfig({ ...recipe }, 0.32);
+    config.name = `Long ${index + 1}`;
+    // Keep the deliberately long strategy/mode; jitter only the scan knobs and
+    // scale so another Long 15 remains varied without regressing to short runs.
+    config.strategy = recipe.strategy;
+    config.mode = recipe.mode;
+    config.minRunRatio = 0.3;
+    config.targetRunRatio = targetRatios[index];
+    config.runPositions = Object.fromEntries(EDGE_SIDES.map((side) => [side, Math.random()]));
+    config.inpaintInsidePx = 1 + Math.floor(Math.random() * 12);
+    config.inpaintOutsidePx = Math.floor(Math.random() * 7);
+    return makeWizardCandidate(frame, config);
+  });
+}
+
+function breedWizardCandidates() {
+  const frame = getSelectedFrame();
+  if (!frame || state.wizard.processing) return;
+  const parents = state.wizard.candidates.filter((candidate) => state.wizard.parentIds.has(candidate.id));
+  if (parents.length === 0) return;
+  const kept = parents.slice(0, 8).map((candidate) => makeWizardCandidate(frame, {
+    ...candidate.config,
+    name: `Kept: ${candidate.config.name.replace(/^Kept: /, "")}`,
+  }, candidate.areas));
+  const next = [...kept];
+  while (next.length < 15) {
+    next.push(makeWizardCandidate(frame, crossoverWizardConfig(parents, next.length)));
+  }
+  state.wizard.generation += 1;
+  state.wizard.candidateKind = parents.some((candidate) => candidate.config.long) ? "long-breed" : "breed";
+  state.wizard.candidates = next;
+  state.wizard.parentIds = new Set(kept.map((candidate) => candidate.id));
+  renderWizard();
+}
+
+function refreshWizardCandidates() {
+  const frame = getSelectedFrame();
+  if (!frame || state.wizard.processing) return;
+  state.wizard.generation += 1;
+  state.wizard.candidateKind = "fresh";
+  state.wizard.parentIds.clear();
+  state.wizard.candidates = makeFreshWizardCandidates(frame);
+  renderWizard();
+}
+
+function refreshLongWizardCandidates() {
+  const frame = getSelectedFrame();
+  if (!frame || state.wizard.processing) return;
+  state.wizard.generation += 1;
+  state.wizard.candidateKind = "long";
+  state.wizard.parentIds.clear();
+  state.wizard.candidates = makeLongWizardCandidates(frame);
+  renderWizard();
+}
+
+function syncWizardMedallionControls() {
+  if (els.wizardLimitMedallions) {
+    els.wizardLimitMedallions.checked = state.wizard.limitMedallions;
+    els.wizardLimitMedallions.disabled = state.wizard.processing;
+  }
+  if (els.wizardMaxMedallions) {
+    els.wizardMaxMedallions.value = String(state.wizard.maxMedallions);
+    els.wizardMaxMedallions.disabled = !state.wizard.limitMedallions || state.wizard.processing;
+  }
+}
+
+function refreshWizardMedallions() {
+  const frame = getSelectedFrame();
+  if (!frame || !state.wizard.visible || state.wizard.processing) return;
+  cancelWizardPreviewInpainting();
+  for (const candidate of state.wizard.candidates) {
+    candidate.config.limitMedallions = state.wizard.limitMedallions;
+    candidate.config.maxMedallions = state.wizard.maxMedallions;
+    candidate.areas = applyWizardMedallions(frame, candidate.baseAreas || candidate.areas, candidate.config);
+    candidate.patch = constrainPatch(frame, patchFromSliceScanAreas(frame, candidate.areas));
+    candidate.metrics = scoreWizardAreas(frame, candidate.areas);
+    candidate.inpaintStatus = candidate.config.autoInpaintPreset ? "idle" : "none";
+    candidate.inpaintError = "";
+    candidate.inpaintPromise = null;
+    candidate.previewPatches = new Map();
+    candidate.previewCanvas = null;
+  }
+  renderWizard();
+}
+
+function setWizardMedallionLimit(enabled) {
+  state.wizard.limitMedallions = Boolean(enabled);
+  syncWizardMedallionControls();
+  refreshWizardMedallions();
+}
+
+function setWizardMaxMedallions(value) {
+  state.wizard.maxMedallions = clamp(Math.round(Number(value) || 0), 0, 6);
+  syncWizardMedallionControls();
+  if (state.wizard.limitMedallions) refreshWizardMedallions();
+}
+
+function forceWizardCenterMedallions() {
+  state.centerMedallions = true;
+  if (els.centerMedallions) {
+    els.centerMedallions.checked = true;
+    els.centerMedallions.disabled = Boolean(state.wizard.editorSession);
+  }
+}
+
+function setWizardPreviewScale(value) {
+  const requested = Number(value);
+  const scale = WIZARD_PREVIEW_SCALES.includes(requested) ? requested : 1;
+  state.wizard.previewScale = scale;
+  document.querySelectorAll("[data-wizard-scale]").forEach((button) => {
+    button.classList.toggle("active", Number(button.dataset.wizardScale) === scale);
+  });
+  renderWizardCanvases();
+}
+
+function setWizardMedallionsHidden(hidden) {
+  const next = state.wizard.visible && Boolean(hidden);
+  if (state.wizard.hideMedallions === next) return;
+  state.wizard.hideMedallions = next;
+  els.wizardModal?.classList.toggle("without-medallions", next);
+  els.wizardMedallionHint?.classList.toggle("active", next);
+  renderWizardCanvases();
+  updateWizardSelectionUi();
+}
+
+function syncWizardButtonLabel() {
+  if (!els.wizardBtn) return;
+  const editing = Boolean(state.wizard.editorSession);
+  els.wizardBtn.textContent = editing ? "Return to Wizard" : "Wizard";
+  els.wizardBtn.title = editing
+    ? "Accept the candidate being edited and continue to the next frame."
+    : "Open or resume the Slice Wizard.";
+  els.wizardBtn.classList.toggle("active", editing);
+  if (els.centerMedallions) els.centerMedallions.disabled = editing;
+}
+
+function showWizardModal() {
+  forceWizardCenterMedallions();
+  state.wizard.visible = true;
+  state.wizard.hideMedallions = false;
+  els.wizardModal?.classList.remove("without-medallions");
+  els.wizardMedallionHint?.classList.remove("active");
+  if (els.wizardModal) els.wizardModal.hidden = false;
+  document.body.classList.add("modal-open");
+  syncWizardMedallionControls();
+  setWizardPreviewScale(state.wizard.previewScale);
+  renderWizard();
+}
+
+function openWizard() {
+  if (state.wizard.editorSession) {
+    resumeWizardFromEditor();
+    return;
+  }
+  const resumableFrame = state.wizard.frameId && state.wizard.candidates.length > 0
+    ? state.frames.find((candidate) => candidate.id === state.wizard.frameId)
+    : null;
+  const frame = resumableFrame || getSelectedFrame();
+  if (!frame) {
+    setStatus("Select a frame before opening the Slice Wizard.");
+    return;
+  }
+  hideEditorContextMenu();
+  closeGridView(false);
+  forceWizardCenterMedallions();
+  if (state.selectedId !== frame.id) {
+    selectFrameById(frame.id, { render: false, allowDuringWizardEdit: true });
+  }
+  if (!resumableFrame) {
+    state.wizard.frameId = frame.id;
+    state.wizard.generation = 0;
+    state.wizard.candidateKind = "fresh";
+    state.wizard.processing = false;
+    state.wizard.processingLabel = "";
+    state.wizard.parentIds.clear();
+    state.wizard.acceptedFrameIds.clear();
+    state.wizard.candidates = makeFreshWizardCandidates(frame);
+    clearWizardSideAssembly(false);
+  }
+  showWizardModal();
+  if (resumableFrame) setStatus(`${frame.name}: resumed the saved wizard session.`);
+}
+
+function closeWizard(reset = false) {
+  cancelWizardPreviewInpainting();
+  state.wizard.visible = false;
+  state.wizard.hideMedallions = false;
+  state.wizard.sideAssemblyActive = false;
+  els.wizardModal?.classList.remove("without-medallions");
+  els.wizardModal?.classList.remove("side-assembly-active");
+  els.wizardMedallionHint?.classList.remove("active");
+  if (reset) {
+    state.wizard.processing = false;
+    state.wizard.processingLabel = "";
+    state.wizard.frameId = null;
+    state.wizard.editorSession = null;
+    state.wizard.acceptedFrameIds.clear();
+    state.wizard.candidates = [];
+    state.wizard.parentIds.clear();
+    clearWizardSideAssembly(false);
+  }
+  if (els.wizardModal) els.wizardModal.hidden = true;
+  document.body.classList.remove("modal-open");
+  syncWizardButtonLabel();
+}
+
+function cloneWizardPatch(patch) {
+  return patch ? { v: { ...patch.v }, h: { ...patch.h }, mode: patch.mode } : null;
+}
+
+function wizardFrameProcessedEntries(frameId) {
+  return [...state.processedPatches.entries()]
+    .filter(([key, patch]) => patch?.frameId === frameId || key.startsWith(`${frameId}:`));
+}
+
+function replaceWizardFrameProcessedEntries(frameId, entries) {
+  for (const [key, patch] of [...state.processedPatches.entries()]) {
+    if (patch?.frameId === frameId || key.startsWith(`${frameId}:`)) state.processedPatches.delete(key);
+  }
+  for (const [key, patch] of entries) state.processedPatches.set(key, patch);
+  rebuildProcessedCanvas(false);
+}
+
+function openWizardCandidateInEditor(candidateId) {
+  if (state.wizard.processing || state.wizard.editorSession) return;
+  const frame = getSelectedFrame();
+  const candidate = state.wizard.candidates.find((item) => item.id === candidateId);
+  if (!frame || !candidate) return;
+  flushPendingSave();
+  state.wizard.editorSession = {
+    frameId: frame.id,
+    candidateId,
+    // Keep the exact accepted objects. The editor receives separate clones, so
+    // these references stay immutable and can be restored byte-for-byte.
+    previousAreas: state.edgeAreas.get(frame.id) || null,
+    previousPatch: state.patches.get(frame.id) || null,
+    previousFrameSettings: state.frameSettings.get(frame.id) || null,
+    previousSelectedSlice: state.selectedSlice ? { ...state.selectedSlice } : null,
+    previousProcessedEntries: wizardFrameProcessedEntries(frame.id),
+  };
+  forceWizardCenterMedallions();
+  state.edgeAreas.set(frame.id, cloneAreas(candidate.areas));
+  state.patches.set(frame.id, cloneWizardPatch(candidate.patch));
+  state.selectedSlice = null;
+  const provisionalEntries = candidate.inpaintStatus === "ready"
+    ? [...candidate.previewPatches.entries()]
+    : [];
+  replaceWizardFrameProcessedEntries(frame.id, provisionalEntries);
+  closeWizard(false);
+  syncWizardButtonLabel();
+  renderAll();
+  setStatus(`Editing “${candidate.config.name}” provisionally. Adjust its repeat regions, then click Return to Wizard to accept it and continue.`);
+}
+
+async function resumeWizardFromEditor() {
+  const edit = state.wizard.editorSession;
+  if (!edit) return;
+  const frame = state.frames.find((item) => item.id === edit.frameId);
+  const candidate = state.wizard.candidates.find((item) => item.id === edit.candidateId);
+  if (!frame || !candidate) {
+    closeWizard(true);
+    setStatus("The edited wizard candidate is no longer available.");
+    return;
+  }
+
+  const editedAreas = state.edgeAreas.get(frame.id);
+  if (editedAreas) {
+    candidate.areas = constrainEdgeAreas(frame, cloneAreas(editedAreas));
+    candidate.baseAreas = cloneAreas(candidate.areas);
+    candidate.patch = constrainPatch(frame, patchFromSliceScanAreas(frame, candidate.areas));
+    candidate.metrics = scoreWizardAreas(frame, candidate.areas);
+    candidate.manuallyEdited = true;
+    candidate.inpaintStatus = candidate.config.autoInpaintPreset ? "idle" : "none";
+    candidate.inpaintError = "";
+    candidate.inpaintPromise = null;
+    candidate.previewPatches = new Map();
+    candidate.previewCanvas = null;
+  }
+
+  if (edit.previousAreas) state.edgeAreas.set(frame.id, edit.previousAreas);
+  else state.edgeAreas.delete(frame.id);
+  if (edit.previousPatch) state.patches.set(frame.id, edit.previousPatch);
+  else state.patches.delete(frame.id);
+  if (edit.previousFrameSettings) state.frameSettings.set(frame.id, edit.previousFrameSettings);
+  else state.frameSettings.delete(frame.id);
+  state.selectedSlice = edit.previousSelectedSlice;
+  replaceWizardFrameProcessedEntries(frame.id, edit.previousProcessedEntries);
+  state.wizard.editorSession = null;
+  state.wizard.frameId = frame.id;
+  state.selectedId = frame.id;
+  syncWizardButtonLabel();
+  applyFrameAreaSettings(frame);
+  renderAll();
+  showWizardModal();
+  await acceptWizardCandidate(candidate.id);
+}
+
+function toggleWizardParent(candidateId) {
+  if (state.wizard.processing) return;
+  if (state.wizard.parentIds.has(candidateId)) state.wizard.parentIds.delete(candidateId);
+  else state.wizard.parentIds.add(candidateId);
+  updateWizardSelectionUi();
+}
+
+function clearWizardParents() {
+  if (state.wizard.processing) return;
+  state.wizard.parentIds.clear();
+  clearWizardSideAssembly(false);
+  updateWizardSelectionUi();
+}
+
+function clearWizardSideAssembly(shouldUpdate = true) {
+  state.wizard.sideCandidateIds = {};
+  state.wizard.sideMedallionsHidden = {};
+  state.wizard.sideSources = {};
+  if (shouldUpdate) updateWizardSelectionUi();
+}
+
+function setWizardSideAssemblyActive(active) {
+  const next = state.wizard.visible && !state.wizard.processing && Boolean(active);
+  if (state.wizard.sideAssemblyActive === next) return;
+  state.wizard.sideAssemblyActive = next;
+  els.wizardModal?.classList.toggle("side-assembly-active", next);
+  for (const button of els.wizardGrid?.querySelectorAll(".wizard-side-picker") || []) {
+    button.tabIndex = next ? 0 : -1;
+  }
+  renderWizardCanvases();
+  updateWizardSelectionUi();
+}
+
+function snapshotWizardSideSource(candidate, side) {
+  const inpaintReady = candidate.config.autoInpaintPreset && candidate.inpaintStatus === "ready";
+  return {
+    id: candidate.id,
+    config: { ...candidate.config },
+    areas: cloneAreas(candidate.areas),
+    inpaintStatus: inpaintReady ? "ready" : (candidate.config.autoInpaintPreset ? "idle" : "none"),
+    inpaintError: "",
+    inpaintPromise: null,
+    previewPatches: inpaintReady
+      ? new Map([...candidate.previewPatches].filter(([, patch]) => patch.side === side))
+      : new Map(),
+    previewSourceCanvas: candidate.previewSourceCanvas,
+    previewCanvas: null,
+  };
+}
+
+function wizardAssemblySourceCandidates() {
+  const sources = {};
+  for (const side of EDGE_SIDES) {
+    const source = state.wizard.sideSources[side];
+    if (source) sources[side] = source;
+  }
+  return sources;
+}
+
+function prepareWizardAssemblyInpaint(frame, winner, sources) {
+  const selected = EDGE_SIDES
+    .map((side) => ({ side, candidate: sources[side] }))
+    .filter(({ candidate }) => candidate?.config.autoInpaintPreset);
+  if (selected.length === 0) return;
+
+  const first = selected[0].candidate;
+  winner.config.autoInpaintPreset = first.config.autoInpaintPreset;
+  winner.config.inpaintInsidePx = first.config.inpaintInsidePx;
+  winner.config.inpaintOutsidePx = first.config.inpaintOutsidePx;
+  winner.inpaintStatus = selected.every(({ candidate }) => candidate.inpaintStatus === "ready") ? "ready" : "pending";
+  const sourceCanvas = wizardPreviewSourceCanvas(frame);
+
+  winner.inpaintPromise = (async () => {
+      const patches = new Map();
+      for (const { side, candidate } of selected) {
+        if (candidate.inpaintStatus === "ready") {
+          for (const [key, patch] of candidate.previewPatches) patches.set(key, patch);
+          continue;
+        }
+        const preset = candidate.config.autoInpaintPreset;
+        const insidePx = clamp(Number(candidate.config.inpaintInsidePx ?? 3), 0, 128);
+        const outsidePx = clamp(Number(candidate.config.inpaintOutsidePx ?? 1), 0, 128);
+        const runs = winner.areas.tileRuns?.[side] || [];
+        for (let index = 0; index < runs.length; index += 1) {
+          const selectedRun = {
+            frame,
+            side,
+            index,
+            rect: runs[index],
+            name: `${side} slice ${index + 1}`,
+            key: slicePatchKey(frame.id, side, index),
+          };
+          const patch = await makeProcessedSlicePatch(selectedRun, preset, insidePx, outsidePx, sourceCanvas);
+          patches.set(selectedRun.key, { ...patch, frameId: frame.id, side, index });
+        }
+      }
+      winner.previewPatches = patches;
+      winner.previewCanvas = composeWizardPreviewCanvas(sourceCanvas, patches, frame);
+      winner.inpaintStatus = "ready";
+      winner.inpaintError = "";
+      return winner;
+    })()
+    .catch((error) => {
+      winner.inpaintStatus = "error";
+      winner.inpaintError = error.message || String(error);
+      throw error;
+    });
+}
+
+function makeWizardSideAssemblyCandidate(frame) {
+  const sources = wizardAssemblySourceCandidates();
+  if (EDGE_SIDES.some((side) => !sources[side])) return null;
+  const seed = sources.top;
+  const areas = {
+    center: cloneRect(seed.areas.center),
+    tileRuns: {},
+    fixedRuns: {},
+    fixedRunsExplicitSides: {},
+    medallions: {},
+    sideModes: {},
+    hiddenMedallionSides: {},
+  };
+  for (const side of EDGE_SIDES) {
+    const source = sources[side];
+    const medallionsHidden = state.wizard.sideMedallionsHidden[side] === true
+      || source.areas.hiddenMedallionSides?.[side] === true;
+    areas[side] = cloneRect(source.areas[side]);
+    const tileRuns = source.areas.tileRuns?.[side] || [];
+    const fixedRuns = source.areas.fixedRuns?.[side] || [];
+    if (tileRuns.length > 0) areas.tileRuns[side] = tileRuns.map(cloneRect);
+    if (!medallionsHidden && fixedRuns.length > 0) areas.fixedRuns[side] = fixedRuns.map(cloneRect);
+    if (!medallionsHidden && source.areas.medallions?.[side]) areas.medallions[side] = cloneRect(source.areas.medallions[side]);
+    if (medallionsHidden) {
+      areas.hiddenMedallionSides[side] = true;
+      areas.fixedRunsExplicitSides[side] = true;
+    } else if (source.areas.fixedRunsExplicit === true || source.areas.fixedRunsExplicitSides?.[side] === true) {
+      areas.fixedRunsExplicitSides[side] = true;
+    }
+    areas.sideModes[side] = source.areas.sideModes?.[side] || source.config.mode;
+  }
+  for (const key of ["tileRuns", "fixedRuns", "fixedRunsExplicitSides", "medallions", "hiddenMedallionSides"]) {
+    if (Object.keys(areas[key]).length === 0) delete areas[key];
+  }
+  const constrainedAreas = constrainEdgeAreas(frame, areas);
+  const winner = {
+    id: ++state.wizard.serial,
+    config: {
+      ...seed.config,
+      name: "Mixed sides",
+      current: false,
+      mode: constrainedAreas.sideModes?.top || seed.config.mode,
+      autoInpaintPreset: null,
+      inpaintInsidePx: null,
+      inpaintOutsidePx: null,
+    },
+    baseAreas: cloneAreas(constrainedAreas),
+    areas: constrainedAreas,
+    patch: constrainPatch(frame, patchFromSliceScanAreas(frame, constrainedAreas)),
+    metrics: scoreWizardAreas(frame, constrainedAreas),
+    inpaintStatus: "none",
+    inpaintError: "",
+    inpaintPromise: null,
+    previewPatches: new Map(),
+    previewSourceCanvas: seed.previewSourceCanvas,
+    previewCanvas: null,
+  };
+  prepareWizardAssemblyInpaint(frame, winner, sources);
+  return winner;
+}
+
+function acceptWizardSideAssembly() {
+  if (state.wizard.processing) return;
+  const frame = getSelectedFrame();
+  if (!frame) return;
+  const winner = makeWizardSideAssemblyCandidate(frame);
+  if (!winner) return;
+  state.wizard.candidates.push(winner);
+  clearWizardSideAssembly(false);
+  acceptWizardCandidate(winner.id);
+}
+
+function toggleWizardSideSource(candidateId, side) {
+  if (state.wizard.processing || !state.wizard.sideAssemblyActive || !EDGE_SIDES.includes(side)) return;
+  const candidate = state.wizard.candidates.find((item) => item.id === candidateId);
+  if (!candidate) return;
+  const medallionsHidden = state.wizard.hideMedallions || candidate.areas.hiddenMedallionSides?.[side] === true;
+  const sameSelection = state.wizard.sideCandidateIds[side] === candidateId
+    && Boolean(state.wizard.sideMedallionsHidden[side]) === medallionsHidden;
+  if (sameSelection) {
+    delete state.wizard.sideCandidateIds[side];
+    delete state.wizard.sideMedallionsHidden[side];
+    delete state.wizard.sideSources[side];
+  } else {
+    state.wizard.sideCandidateIds[side] = candidateId;
+    state.wizard.sideSources[side] = snapshotWizardSideSource(candidate, side);
+    if (medallionsHidden) state.wizard.sideMedallionsHidden[side] = true;
+    else delete state.wizard.sideMedallionsHidden[side];
+  }
+  updateWizardSelectionUi();
+  if (EDGE_SIDES.every((candidateSide) => state.wizard.sideSources[candidateSide])) {
+    acceptWizardSideAssembly();
+  }
+}
+
+function wizardAreasWithoutMedallions(frame, sourceAreas) {
+  const areas = cloneAreas(sourceAreas);
+  areas.fixedRuns = {};
+  areas.medallions = {};
+  areas.hiddenMedallionSides = Object.fromEntries(EDGE_SIDES.map((side) => [side, true]));
+  areas.fixedRunsExplicitSides = {
+    ...(areas.fixedRunsExplicitSides || {}),
+    ...Object.fromEntries(EDGE_SIDES.map((side) => [side, true])),
+  };
+  return constrainEdgeAreas(frame, areas);
+}
+
+function commitWizardCandidate(frame, winner, disableMedallions = false) {
+  if (state.hasProcessedPatches) clearProcessedFrame(frame.id, false);
+  const acceptedAreas = disableMedallions
+    ? wizardAreasWithoutMedallions(frame, winner.areas)
+    : cloneAreas(winner.areas);
+  const acceptedPatch = disableMedallions
+    ? patchFromSliceScanAreas(frame, acceptedAreas)
+    : winner.patch;
+  state.edgeAreas.set(frame.id, acceptedAreas);
+  state.patches.set(frame.id, constrainPatch(frame, acceptedPatch));
+  state.previewMode = winner.config.mode;
+  setInputValue(els.sliceThreshold, winner.config.threshold);
+  setInputValue(els.sliceBridgeGap, winner.config.bridge);
+  setInputValue(els.sliceCornerGuard, winner.config.corner);
+  setInputValue(els.sliceLengthLimit, winner.config.length);
+  syncModeButtons("[data-preview-mode]", "previewMode", state.previewMode);
+  // These values describe the already-generated winning areas. Updating their
+  // labels must not run Slice Scan again and overwrite the chosen geometry.
+  updateControlLabels();
+  clearSelectedSlice(false);
+  rememberFrameSettings(frame);
+  scheduleSaveCurrentImageState();
+}
+
+function wizardCandidateSelections(frame, winner) {
+  const selections = [];
+  for (const side of EDGE_SIDES) {
+    const runs = winner.areas.tileRuns?.[side] || [];
+    runs.forEach((rect, index) => selections.push({
+      frame,
+      side,
+      index,
+      rect,
+      name: `${side} slice ${index + 1}`,
+      key: slicePatchKey(frame.id, side, index),
+    }));
+  }
+  return selections;
+}
+
+function cancelWizardPreviewInpainting() {
+  state.wizard.previewBatchId += 1;
+  if (state.wizard.previewBatch) state.wizard.previewBatch.cancelled = true;
+  state.wizard.previewBatch = null;
+}
+
+function wizardPreviewSourceCanvas(frame) {
+  const renderCanvas = getRenderCanvas();
+  const canvas = createCanvas(renderCanvas.width, renderCanvas.height);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(renderCanvas, 0, 0);
+  // Existing committed processing for this frame belongs to its old geometry.
+  // Restore the clean keyed frame before creating candidate-local patches.
+  ctx.drawImage(
+    state.keyedCanvas,
+    frame.x,
+    frame.y,
+    frame.w,
+    frame.h,
+    frame.x,
+    frame.y,
+    frame.w,
+    frame.h,
+  );
+  return canvas;
+}
+
+function wizardPreviewPatchKey(selected, preset, insidePx, outsidePx) {
+  const rect = selected.rect;
+  return [
+    preset,
+    insidePx,
+    outsidePx,
+    selected.frame.id,
+    selected.side,
+    rect.x,
+    rect.y,
+    rect.w,
+    rect.h,
+  ].join(":");
+}
+
+function composeWizardPreviewCanvas(sourceCanvas, patches, frame) {
+  const canvas = cropCanvas(sourceCanvas, frameSheetRect(frame, { x: 0, y: 0, w: frame.w, h: frame.h }));
+  const ctx = canvas.getContext("2d");
+  for (const patch of patches.values()) ctx.drawImage(patch.canvas, patch.x - frame.x, patch.y - frame.y);
+  return canvas;
+}
+
+function updateWizardCandidateInpaintUi(candidate) {
+  const card = els.wizardGrid?.querySelector(`[data-wizard-candidate="${candidate.id}"]`);
+  const badge = card?.querySelector(".wizard-inpaint-status");
+  if (!badge) return;
+  const insidePx = candidate.config.inpaintInsidePx;
+  const outsidePx = candidate.config.inpaintOutsidePx;
+  const distanceText = insidePx === undefined || insidePx === null
+    ? ""
+    : ` · ${insidePx}px IN / ${outsidePx || 0}px OUT`;
+  const labels = {
+    queued: `INPAINT QUEUED${distanceText}`,
+    pending: `INPAINTING${distanceText}`,
+    ready: `INPAINTED${distanceText}`,
+    error: `INPAINT FAILED${distanceText}`,
+  };
+  badge.hidden = !labels[candidate.inpaintStatus];
+  badge.textContent = labels[candidate.inpaintStatus] || "";
+  badge.dataset.status = candidate.inpaintStatus;
+  badge.title = candidate.inpaintError || "Candidate-local provisional processing; discarded unless accepted.";
+}
+
+async function buildWizardCandidatePreview(frame, candidate, batch) {
+  if (batch.cancelled) return;
+  candidate.inpaintStatus = "pending";
+  updateWizardCandidateInpaintUi(candidate);
+  const preset = candidate.config.autoInpaintPreset;
+  const insidePx = clamp(
+    Number(candidate.config.inpaintInsidePx ?? batch.defaultInsidePx),
+    0,
+    128,
+  );
+  const outsidePx = clamp(
+    Number(candidate.config.inpaintOutsidePx ?? batch.defaultOutsidePx),
+    0,
+    128,
+  );
+  const selections = wizardCandidateSelections(frame, candidate);
+  const patches = new Map();
+  try {
+    for (const selected of selections) {
+      if (batch.cancelled || batch.id !== state.wizard.previewBatchId) return;
+      const cacheKey = wizardPreviewPatchKey(selected, preset, insidePx, outsidePx);
+      let patchPromise = batch.patchCache.get(cacheKey);
+      if (!patchPromise) {
+        patchPromise = makeProcessedSlicePatch(
+          selected,
+          preset,
+          insidePx,
+          outsidePx,
+          batch.sourceCanvas,
+        );
+        batch.patchCache.set(cacheKey, patchPromise);
+      }
+      const cachedPatch = await patchPromise;
+      patches.set(selected.key, {
+        ...cachedPatch,
+        frameId: selected.frame.id,
+        side: selected.side,
+        index: selected.index,
+      });
+    }
+    if (batch.cancelled || batch.id !== state.wizard.previewBatchId) return;
+    candidate.previewPatches = patches;
+    candidate.previewCanvas = composeWizardPreviewCanvas(batch.sourceCanvas, patches, frame);
+    candidate.inpaintStatus = "ready";
+    candidate.inpaintError = "";
+    updateWizardCandidateInpaintUi(candidate);
+    renderWizardCanvases(candidate.id);
+    updateWizardSelectionUi();
+  } catch (error) {
+    if (batch.cancelled || batch.id !== state.wizard.previewBatchId) return;
+    candidate.inpaintStatus = "error";
+    candidate.inpaintError = error.message || String(error);
+    updateWizardCandidateInpaintUi(candidate);
+    updateWizardSelectionUi();
+  }
+}
+
+function prepareWizardCandidatePreviews(frame, candidates) {
+  cancelWizardPreviewInpainting();
+  const frameRect = { x: frame.x, y: frame.y, w: frame.w, h: frame.h };
+  const cleanFrameCanvas = cropCanvas(state.keyedCanvas, frameRect);
+  const committedFrameCanvas = cropCanvas(getRenderCanvas(), frameRect);
+  for (const candidate of candidates) {
+    candidate.previewSourceCanvas = candidate.config.current ? committedFrameCanvas : cleanFrameCanvas;
+  }
+  const eligible = candidates.filter((candidate) => candidate.config.autoInpaintPreset);
+  if (eligible.length === 0) return;
+  const batch = {
+    id: state.wizard.previewBatchId,
+    cancelled: false,
+    queue: [...eligible],
+    sourceCanvas: wizardPreviewSourceCanvas(frame),
+    patchCache: new Map(),
+    defaultInsidePx: clamp(Number(els.processInsidePx?.value || 3), 0, 128),
+    defaultOutsidePx: clamp(Number(els.processOutsidePx?.value || 1), 0, 128),
+  };
+  batch.frameCanvas = cleanFrameCanvas;
+  state.wizard.previewBatch = batch;
+  for (const candidate of eligible) {
+    candidate.previewSourceCanvas = batch.frameCanvas;
+    candidate.inpaintStatus = "queued";
+    candidate.inpaintError = "";
+    let resolvePreview;
+    candidate.inpaintPromise = new Promise((resolve) => { resolvePreview = resolve; });
+    candidate.resolveInpaintPreview = resolvePreview;
+    updateWizardCandidateInpaintUi(candidate);
+  }
+  const worker = async () => {
+    while (!batch.cancelled && batch.queue.length > 0) {
+      const candidate = batch.queue.shift();
+      await buildWizardCandidatePreview(frame, candidate, batch);
+      candidate.resolveInpaintPreview?.(candidate);
+      delete candidate.resolveInpaintPreview;
+    }
+  };
+  const workerCount = Math.min(3, eligible.length);
+  Promise.all(Array.from({ length: workerCount }, worker)).then(() => {
+    if (!batch.cancelled && state.wizard.previewBatch === batch) updateWizardSelectionUi();
+  });
+}
+
+async function promoteWizardCandidateInpaint(frame, winner) {
+  const preset = winner.config.autoInpaintPreset;
+  if (!preset) return 0;
+  const batch = state.wizard.previewBatch;
+  if (winner.inpaintStatus === "queued" && batch) {
+    const queuedIndex = batch.queue.indexOf(winner);
+    if (queuedIndex >= 0) {
+      batch.queue.splice(queuedIndex, 1);
+      batch.queue.unshift(winner);
+    }
+  }
+  state.processingBusy = true;
+  state.wizard.processing = true;
+  state.wizard.processingLabel = winner.inpaintStatus === "ready"
+    ? `Applying the provisional ${PROCESS_PRESETS[preset] || preset} preview...`
+    : `Finishing the provisional ${PROCESS_PRESETS[preset] || preset} preview...`;
+  renderProcessingPane();
+  updateWizardSelectionUi();
+  try {
+    if (winner.inpaintPromise) await winner.inpaintPromise;
+    if (winner.inpaintStatus !== "ready") {
+      throw new Error(winner.inpaintError || "The provisional inpaint preview did not complete.");
+    }
+    for (const [key, patch] of winner.previewPatches) state.processedPatches.set(key, patch);
+    rebuildProcessedCanvas(false);
+    const count = winner.previewPatches.size;
+    setProcessingStatus(`${PROCESS_PRESETS[preset] || preset}: accepted ${count} provisional region${count === 1 ? "" : "s"}.`);
+    return count;
+  } finally {
+    state.processingBusy = false;
+    state.wizard.processing = false;
+    state.wizard.processingLabel = "";
+    renderProcessingPane();
+    updateWizardSelectionUi();
+  }
+}
+
+async function acceptWizardCandidate(candidateId, disableMedallions = false) {
+  if (state.wizard.processing) return;
+  const frame = getSelectedFrame();
+  const winner = state.wizard.candidates.find((candidate) => candidate.id === candidateId);
+  if (!frame || !winner) return;
+  commitWizardCandidate(frame, winner, disableMedallions);
+  const medallionNote = disableMedallions ? " without medallions" : "";
+  let inpaintNote = "";
+  if (winner.config.autoInpaintPreset) {
+    try {
+      const count = await promoteWizardCandidateInpaint(frame, winner);
+      inpaintNote = count > 0 ? ` Inpainted ${count} long repeat region${count === 1 ? "" : "s"}.` : "";
+    } catch (error) {
+      rebuildProcessedCanvas(false);
+      const hint = location.protocol === "file:"
+        ? " Start the local server with python3 server.py to enable automatic inpainting."
+        : "";
+      inpaintNote = ` Automatic inpainting failed: ${error.message}.${hint}`;
+      setProcessingStatus(inpaintNote.trim());
+    }
+  }
+  state.wizard.acceptedFrameIds.add(frame.id);
+  const frameIndex = state.frames.findIndex((candidate) => candidate.id === frame.id);
+  const nextFrame = state.frames[frameIndex + 1] || null;
+  if (!nextFrame) {
+    closeWizard(true);
+    renderAll();
+    setStatus(`${frame.name}: accepted “${winner.config.name}”${medallionNote}.${inpaintNote} Wizard complete.`);
+    return;
+  }
+  selectFrameById(nextFrame.id, { render: false });
+  forceWizardCenterMedallions();
+  state.wizard.frameId = nextFrame.id;
+  state.wizard.generation = 0;
+  state.wizard.candidateKind = "fresh";
+  state.wizard.parentIds.clear();
+  state.wizard.candidates = makeFreshWizardCandidates(nextFrame);
+  clearWizardSideAssembly(false);
+  renderWizard();
+  setStatus(`${frame.name}: accepted “${winner.config.name}”${medallionNote}.${inpaintNote} Now reviewing ${nextFrame.name}.`);
+}
+
+function createWizardCanvas(className, title = "") {
+  const canvas = document.createElement("canvas");
+  canvas.className = className;
+  canvas.width = 1;
+  canvas.height = 1;
+  canvas.title = title;
+  return canvas;
+}
+
+function createWizardDiagnostic() {
+  const preview = document.createElement("div");
+  preview.className = "wizard-preview-square";
+
+  const outer = createWizardCanvas("wizard-preview-outer", "Square preview");
+  const inset = document.createElement("div");
+  inset.className = "wizard-preview-inset";
+  const minimum = createWizardCanvas("wizard-preview-mini", "Minimum with medallions");
+  inset.append(minimum);
+  preview.append(outer, inset);
+  return preview;
+}
+
+function renderWizardCanvas(canvas, frame, candidate, variant, cssWidth, cssHeight) {
+  const scale = state.wizard.previewScale || 1;
+  const width = Math.max(1, Math.round(cssWidth / scale));
+  const height = Math.max(1, Math.round(cssHeight / scale));
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, width, height);
+  ctx.imageSmoothingEnabled = false;
+  const previewSource = candidate.previewCanvas || candidate.previewSourceCanvas;
+  const renderFrame = previewSource ? { ...frame, x: 0, y: 0 } : frame;
+  withRenderCanvas(previewSource, () => {
+    renderEdgeFrame(
+      ctx,
+      renderFrame,
+      candidate.areas,
+      width,
+      height,
+      candidate.config.mode,
+      variant,
+      !state.wizard.hideMedallions,
+    );
+  });
+}
+
+function getWizardMinimumEdgeSpan(frame, areas, side, corners, includeMedallions) {
+  if (!includeMedallions || areas.hiddenMedallionSides?.[side] === true) return 1;
+  const axis = sideAxis(side);
+  const area = edgeSideRenderArea(frame, areas, side, corners);
+  const fixedRuns = normalizedFixedRunsForRender(
+    area,
+    areas.fixedRuns?.[side] || [],
+    areas.medallions?.[side] || null,
+    axis,
+  );
+  if (fixedRuns.length === 0) return 1;
+  const segments = buildEdgeSegments(area, fixedRuns, axis);
+  const fixedSize = segments.reduce((sum, segment) => (
+    sum + (segment.kind === "fixed" ? (axis === "x" ? segment.rect.w : segment.rect.h) : 0)
+  ), 0);
+  const flexCount = segments.filter((segment) => segment.kind === "flex").length;
+  return Math.max(1, Math.ceil(fixedSize) + Math.max(1, flexCount));
+}
+
+function getWizardMinimumSize(frame, areas, includeMedallions) {
+  const bands = getEdgeRenderBands(frame, areas);
+  const corners = getCornerSourceAreas(frame, areas, bands);
+  return {
+    w: Math.max(
+      1,
+      bands.left + bands.right + 1,
+      corners.topLeft.w + getWizardMinimumEdgeSpan(frame, areas, "top", corners, includeMedallions) + corners.topRight.w,
+      corners.bottomLeft.w + getWizardMinimumEdgeSpan(frame, areas, "bottom", corners, includeMedallions) + corners.bottomRight.w,
+    ),
+    h: Math.max(
+      1,
+      bands.top + bands.bottom + 1,
+      corners.topLeft.h + getWizardMinimumEdgeSpan(frame, areas, "left", corners, includeMedallions) + corners.bottomLeft.h,
+      corners.topRight.h + getWizardMinimumEdgeSpan(frame, areas, "right", corners, includeMedallions) + corners.bottomRight.h,
+    ),
+  };
+}
+
+function renderWizardMinimumCanvas(canvas, frame, candidate, includeMedallions) {
+  const previewScale = state.wizard.previewScale || 1;
+  const size = getWizardMinimumSize(frame, candidate.areas, includeMedallions);
+  if (canvas.width !== size.w) canvas.width = size.w;
+  if (canvas.height !== size.h) canvas.height = size.h;
+  canvas.style.width = `${size.w * previewScale}px`;
+  canvas.style.height = `${size.h * previewScale}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, size.w, size.h);
+  ctx.imageSmoothingEnabled = false;
+  const previewSource = candidate.previewCanvas || candidate.previewSourceCanvas;
+  const renderFrame = previewSource ? { ...frame, x: 0, y: 0 } : frame;
+  withRenderCanvas(previewSource, () => {
+    renderEdgeFrame(
+      ctx,
+      renderFrame,
+      candidate.areas,
+      size.w,
+      size.h,
+      candidate.config.mode,
+      "full",
+      includeMedallions,
+    );
+  });
+}
+
+function renderWizardCanvases(candidateId = null) {
+  if (!state.wizard.visible || !els.wizardGrid) return;
+  const frame = getSelectedFrame();
+  if (!frame) return;
+  for (const card of els.wizardGrid.querySelectorAll("[data-wizard-candidate]")) {
+    const cardCandidateId = Number(card.dataset.wizardCandidate);
+    if (candidateId !== null && cardCandidateId !== candidateId) continue;
+    const candidate = state.wizard.candidates.find((item) => item.id === cardCandidateId);
+    const preview = card.querySelector(".wizard-preview-square");
+    const outer = preview?.querySelector(".wizard-preview-outer");
+    if (!candidate || !preview || !outer) continue;
+    const previewRect = preview.getBoundingClientRect();
+    renderWizardCanvas(outer, frame, candidate, "full", previewRect.width, previewRect.height);
+    const mini = preview.querySelector(".wizard-preview-mini");
+    if (!mini) continue;
+    const includeMedallions = !state.wizard.hideMedallions;
+    mini.title = includeMedallions ? "Minimum with medallions" : "Minimum without medallions";
+    renderWizardMinimumCanvas(mini, frame, candidate, includeMedallions);
+  }
+}
+
+function updateWizardSelectionUi() {
+  if (!state.wizard.visible) return;
+  for (const card of els.wizardGrid?.querySelectorAll("[data-wizard-candidate]") || []) {
+    const id = Number(card.dataset.wizardCandidate);
+    const parent = state.wizard.parentIds.has(id);
+    card.classList.toggle("parent", parent);
+    card.setAttribute("aria-pressed", parent ? "true" : "false");
+    card.setAttribute("aria-disabled", state.wizard.processing ? "true" : "false");
+    for (const button of card.querySelectorAll(".wizard-side-picker")) {
+      const side = button.dataset.side;
+      const sideLocked = Boolean(state.wizard.sideSources[side]);
+      const selected = state.wizard.sideCandidateIds[side] === id;
+      const medallionsHidden = selected && state.wizard.sideMedallionsHidden[side] === true;
+      button.hidden = sideLocked && !selected;
+      button.classList.toggle("selected", selected);
+      button.classList.toggle("without-medallion", medallionsHidden);
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+      button.textContent = medallionsHidden ? `${button.dataset.sideLabel}−` : button.dataset.sideLabel;
+      button.title = medallionsHidden
+        ? `${button.dataset.baseTitle} (medallions permanently hidden)`
+        : button.dataset.baseTitle;
+      button.setAttribute("aria-label", medallionsHidden
+        ? `${button.dataset.baseAriaLabel}; medallions permanently hidden`
+        : button.dataset.baseAriaLabel);
+      button.disabled = state.wizard.processing;
+      button.tabIndex = state.wizard.sideAssemblyActive && !state.wizard.processing ? 0 : -1;
+    }
+  }
+  for (const marker of els.wizardSideSelectionStatus?.querySelectorAll("[data-wizard-selection-side]") || []) {
+    const side = marker.dataset.wizardSelectionSide;
+    const source = state.wizard.sideSources[side];
+    const medallionsHidden = Boolean(source && state.wizard.sideMedallionsHidden[side]);
+    marker.classList.toggle("selected", Boolean(source));
+    marker.classList.toggle("without-medallion", medallionsHidden);
+    marker.title = source
+      ? `${side}: ${source.config.name}${medallionsHidden ? " · medallions hidden" : ""}`
+      : `${side}: not selected`;
+  }
+  const sideSelectionCount = EDGE_SIDES.filter((side) => state.wizard.sideSources[side]).length;
+  if (els.wizardSideSelectionStatus) {
+    els.wizardSideSelectionStatus.setAttribute(
+      "aria-label",
+      `Selected mixed sides: ${sideSelectionCount} of 4`,
+    );
+  }
+  if (els.wizardRefreshBtn) els.wizardRefreshBtn.disabled = state.wizard.processing;
+  if (els.wizardLongBtn) els.wizardLongBtn.disabled = state.wizard.processing;
+  if (els.wizardBreedBtn) els.wizardBreedBtn.disabled = state.wizard.processing || state.wizard.parentIds.size === 0;
+  if (els.wizardClearBtn) els.wizardClearBtn.disabled = state.wizard.processing || (state.wizard.parentIds.size === 0 && sideSelectionCount === 0);
+  if (els.wizardCloseBtn) els.wizardCloseBtn.disabled = state.wizard.processing;
+  syncWizardMedallionControls();
+  const frame = getSelectedFrame();
+  if (els.wizardSummary && frame) {
+    if (state.wizard.processing) {
+      els.wizardSummary.textContent = state.wizard.processingLabel || `Inpainting ${frame.name}...`;
+      return;
+    }
+    const parentText = state.wizard.parentIds.size > 0 ? ` · ${state.wizard.parentIds.size} parent${state.wizard.parentIds.size === 1 ? "" : "s"} kept` : "";
+    const medallionText = state.wizard.hideMedallions ? " · medallions hidden" : "";
+    const kindText = state.wizard.candidateKind.startsWith("long") ? " · random runs ≥30% of each usable side · random inpaint distances" : "";
+    const limitedMedallionText = state.wizard.limitMedallions
+      ? state.wizard.maxMedallions === 0
+        ? " · centered medallions disabled"
+        : ` · maximum ${state.wizard.maxMedallions} centered medallion${state.wizard.maxMedallions === 1 ? "" : "s"} per side`
+      : " · centered medallions auto-detected";
+    const inpaintCandidates = state.wizard.candidates.filter((candidate) => candidate.config.autoInpaintPreset);
+    const readyCount = inpaintCandidates.filter((candidate) => candidate.inpaintStatus === "ready").length;
+    const errorCount = inpaintCandidates.filter((candidate) => candidate.inpaintStatus === "error").length;
+    const inpaintText = inpaintCandidates.length > 0
+      ? ` · provisional inpaint ${readyCount}/${inpaintCandidates.length}${errorCount > 0 ? ` (${errorCount} failed)` : ""}`
+      : "";
+    const acceptedText = state.wizard.acceptedFrameIds.size > 0
+      ? ` · ${state.wizard.acceptedFrameIds.size} accepted frame${state.wizard.acceptedFrameIds.size === 1 ? "" : "s"} saved`
+      : "";
+    const selectedSideLabels = EDGE_SIDES
+      .filter((side) => state.wizard.sideSources[side])
+      .map((side) => `${side[0].toUpperCase()}${state.wizard.sideMedallionsHidden[side] ? "−" : ""}`);
+    const sideAssemblyText = sideSelectionCount > 0
+      ? ` · mixed sides ${sideSelectionCount}/4 (${selectedSideLabels.join("/")}); the fourth side accepts`
+      : state.wizard.sideAssemblyActive
+        ? " · mixed-side mode: choose T/B/L/R; the fourth side accepts"
+        : "";
+    const frameIndex = state.frames.findIndex((candidate) => candidate.id === frame.id);
+    els.wizardSummary.textContent = `${frame.name} · frame ${frameIndex + 1} of ${state.frames.length} · generation ${state.wizard.generation + 1} · ${state.wizard.candidates.length} options${kindText}${limitedMedallionText}${inpaintText}${parentText}${sideAssemblyText}${acceptedText}${medallionText}`;
+  }
+}
+
+function wizardCandidateRunPercentages(candidate) {
+  const percentages = {};
+  for (const side of EDGE_SIDES) {
+    const area = candidate.areas[side];
+    const axis = sideAxis(side);
+    const available = Math.max(1, rectPrimaryEnd(area, axis) - rectPrimaryStart(area, axis));
+    const repeated = (candidate.areas.tileRuns?.[side] || []).reduce((sum, rect) => (
+      sum + Math.max(0, rectPrimaryEnd(rect, axis) - rectPrimaryStart(rect, axis))
+    ), 0);
+    percentages[side] = Math.round(clamp(repeated / available, 0, 1) * 100);
+  }
+  return percentages;
+}
+
+function wizardRunLengthLabel(percentages) {
+  const values = Object.values(percentages);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  if (max - min <= 2) return `${Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)}%`;
+  return `${min}–${max}%`;
+}
+
+function renderWizard() {
+  if (!els.wizardGrid || !state.wizard.visible) return;
+  setWizardPreviewScale(state.wizard.previewScale);
+  const frame = getSelectedFrame();
+  els.wizardGrid.innerHTML = "";
+  if (!frame) return;
+  state.wizard.candidates.forEach((candidate, index) => {
+    const card = document.createElement("article");
+    card.className = "wizard-card";
+    card.dataset.wizardCandidate = String(candidate.id);
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-disabled", state.wizard.processing ? "true" : "false");
+    card.setAttribute("aria-label", `Accept option ${index + 1}: ${candidate.config.name}. Control-click to accept without medallions.`);
+    const runPercentages = wizardCandidateRunPercentages(candidate);
+    const runDetails = `T ${runPercentages.top}% · B ${runPercentages.bottom}% · L ${runPercentages.left}% · R ${runPercentages.right}%`;
+    const randomDetails = candidate.config.long
+      ? `\nActual repeat lengths ${runDetails}\nRandom target ${Math.round(candidate.config.targetRunRatio * 100)}% · inpaint ${candidate.config.inpaintInsidePx}px inside / ${candidate.config.inpaintOutsidePx}px outside`
+      : "";
+    card.title = `${candidate.config.name}\n${WIZARD_MODE_LABELS[candidate.config.mode]} · ${WIZARD_STRATEGY_LABELS[candidate.config.strategy]}\nSeam ${candidate.metrics.seam} · repeat ${candidate.metrics.coverage}% · largest chunk ${candidate.metrics.chunk}px${randomDetails}\nCtrl-click accepts without medallions`;
+    card.addEventListener("click", (event) => acceptWizardCandidate(candidate.id, event.ctrlKey));
+    card.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      toggleWizardParent(candidate.id);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        acceptWizardCandidate(candidate.id, event.ctrlKey);
+      }
+    });
+
+    const sidePickers = EDGE_SIDES.map((side) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "wizard-side-picker";
+      button.dataset.side = side;
+      button.dataset.sideLabel = side[0].toUpperCase();
+      button.textContent = button.dataset.sideLabel;
+      button.title = `Use the ${side} side from option ${index + 1}`;
+      button.setAttribute("aria-label", `Use ${side} side from option ${index + 1}: ${candidate.config.name}`);
+      button.dataset.baseTitle = button.title;
+      button.dataset.baseAriaLabel = button.getAttribute("aria-label");
+      button.setAttribute("aria-pressed", "false");
+      button.tabIndex = state.wizard.sideAssemblyActive ? 0 : -1;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleWizardSideSource(candidate.id, side);
+      });
+      button.addEventListener("keydown", (event) => event.stopPropagation());
+      return button;
+    });
+
+    const preview = createWizardDiagnostic();
+    const lengthStatus = document.createElement("span");
+    lengthStatus.className = "wizard-length-status";
+    lengthStatus.textContent = `RUN ${wizardRunLengthLabel(runPercentages)}`;
+    lengthStatus.title = `Actual repeat lengths: ${runDetails}`;
+    const inpaintStatus = document.createElement("span");
+    inpaintStatus.className = "wizard-inpaint-status";
+    inpaintStatus.hidden = true;
+    const editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.className = "wizard-edit-button";
+    editButton.textContent = candidate.manuallyEdited ? "Edit again" : "Open in Editor";
+    editButton.title = "Open this candidate in the normal Areas editor without accepting it.";
+    editButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openWizardCandidateInEditor(candidate.id);
+    });
+    editButton.addEventListener("keydown", (event) => event.stopPropagation());
+    card.append(preview, ...sidePickers, lengthStatus, inpaintStatus, editButton);
+    els.wizardGrid.append(card);
+  });
+  prepareWizardCandidatePreviews(frame, state.wizard.candidates);
+  renderWizardCanvases();
+  updateWizardSelectionUi();
+}
+
 // Renders one labeled, self-contained preview for a grid card. Each variant gets
 // its own canvas/box so the sections sit side by side instead of overlapping.
 function createGridMini(frame, areas, label, variant) {
@@ -3239,7 +5378,7 @@ function getEdgePreviewSize(frame, areas, variant = "full") {
   };
 }
 
-function renderEdgeFrame(ctx, frame, areas, dw, dh, mode, variant = "full") {
+function renderEdgeFrame(ctx, frame, areas, dw, dh, mode, variant = "full", includeMedallions = true) {
   const bands = getEdgeRenderBands(frame, areas);
   const sourceWidths = [bands.left, bands.centerW, bands.right];
   const sourceHeights = [bands.top, bands.centerH, bands.bottom];
@@ -3265,11 +5404,16 @@ function renderEdgeFrame(ctx, frame, areas, dw, dh, mode, variant = "full") {
   };
 
   if (variant !== "corners") {
-    const edgeMode = mode === "mirror" ? "mirror" : mode;
     for (const side of ["top", "bottom", "left", "right"]) {
+      const configuredMode = areas.sideModes?.[side] || mode;
+      const selectedMode = areas.hiddenMedallionSides?.[side] === true && configuredMode === "stretch"
+        ? "tile_stretch"
+        : configuredMode;
+      const edgeMode = selectedMode === "mirror" ? "mirror" : selectedMode;
+      const showMedallions = includeMedallions && areas.hiddenMedallionSides?.[side] !== true;
       const axis = sideAxis(side);
       const drawArea = edgeSideRenderArea(frame, areas, side, corners);
-      drawSegmentedEdgeArea(ctx, frame, areas, side, sideDestRect(frame, areas, side, dx, dy, destWidths, destHeights, bands, drawArea, cornerDests, dw, dh), axis, edgeMode, drawArea);
+      drawSegmentedEdgeArea(ctx, frame, areas, side, sideDestRect(frame, areas, side, dx, dy, destWidths, destHeights, bands, drawArea, cornerDests, dw, dh), axis, edgeMode, drawArea, showMedallions);
     }
   }
 
@@ -3357,13 +5501,15 @@ function mapFixedAxis(sourceStart, sourceSize, bandStart, bandSize, destStart, d
   };
 }
 
-function drawSegmentedEdgeArea(ctx, frame, areas, side, dest, axis, mode, sourceArea = areas[side]) {
+function drawSegmentedEdgeArea(ctx, frame, areas, side, dest, axis, mode, sourceArea = areas[side], includeMedallions = true) {
   const area = sourceArea;
   const tileRuns = areas.tileRuns?.[side] || [];
-  const explicitFixedRuns = areas.fixedRuns?.[side] || [];
-  const fixedRuns = normalizedFixedRunsForRender(area, explicitFixedRuns, areas.medallions?.[side], axis);
+  const explicitFixedRuns = includeMedallions ? (areas.fixedRuns?.[side] || []) : [];
+  const fallbackMedallion = includeMedallions ? areas.medallions?.[side] : null;
+  const fixedRuns = normalizedFixedRunsForRender(area, explicitFixedRuns, fallbackMedallion, axis);
   if (fixedRuns.length === 0) {
-    drawEdgeArea(ctx, frame, area, dest, axis, mode, tileRuns);
+    const noMedallionMode = !includeMedallions && mode === "stretch" ? "tile_stretch" : mode;
+    drawEdgeArea(ctx, frame, area, dest, axis, noMedallionMode, tileRuns);
     return;
   }
 
@@ -3425,7 +5571,13 @@ function buildEdgeSegments(area, fixedRuns, axis) {
 function edgeSegmentDestSizes(segments, destAxisSize, axis) {
   const sourceSizes = segments.map((segment) => Math.max(0, rectPrimaryEnd(segment.rect, axis) - rectPrimaryStart(segment.rect, axis)));
   const fixedTotal = segments.reduce((sum, segment, i) => sum + (segment.kind === "fixed" ? sourceSizes[i] : 0), 0);
-  const flexTotal = segments.reduce((sum, segment, i) => sum + (segment.kind === "flex" ? Math.max(sourceSizes[i], 1) : 0), 0);
+  // Each flex (stretch) segment's share of the leftover space is its WEIGHT. By
+  // default the weight is the segment's source size, so a bigger source region
+  // grabs more stretch — which pushes medallions off-centre. With "center
+  // medallions" on, every flex segment weighs the same, so the stretch is split
+  // evenly on each side of a fixed run and the medallion holds its centre.
+  const flexWeight = (i) => (state.centerMedallions ? 1 : Math.max(sourceSizes[i], 1));
+  const flexTotal = segments.reduce((sum, segment, i) => sum + (segment.kind === "flex" ? flexWeight(i) : 0), 0);
   if (destAxisSize <= 0) return segments.map(() => 0);
   if (flexTotal <= 0 || destAxisSize <= fixedTotal) {
     const scaleTotal = fixedTotal > 0 ? fixedTotal : sourceSizes.reduce((sum, size) => sum + size, 0);
@@ -3436,7 +5588,7 @@ function edgeSegmentDestSizes(segments, destAxisSize, axis) {
   return segments.map((segment, i) => (
     segment.kind === "fixed"
       ? sourceSizes[i]
-      : remaining * (Math.max(sourceSizes[i], 1) / flexTotal)
+      : remaining * (flexWeight(i) / flexTotal)
   ));
 }
 
@@ -4064,6 +6216,17 @@ function loadCanvasFromDataUrl(dataUrl) {
   });
 }
 
+function restoreCanvasAlpha(sourceCanvas, targetCanvas) {
+  if (sourceCanvas.width !== targetCanvas.width || sourceCanvas.height !== targetCanvas.height) return targetCanvas;
+  const source = sourceCanvas.getContext("2d", { willReadFrequently: true })
+    .getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+  const targetCtx = targetCanvas.getContext("2d", { willReadFrequently: true });
+  const target = targetCtx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
+  for (let i = 3; i < target.data.length; i += 4) target.data[i] = source.data[i];
+  targetCtx.putImageData(target, 0, 0);
+  return targetCanvas;
+}
+
 async function runGmicInpaint(imageCanvas, maskCanvas, preset) {
   const response = await fetch("/api/gmic/inpaint", {
     method: "POST",
@@ -4083,7 +6246,8 @@ async function runGmicInpaint(imageCanvas, maskCanvas, preset) {
   if (!response.ok) {
     throw new Error(payload?.error || "GMIC processing failed.");
   }
-  return loadCanvasFromDataUrl(payload.image);
+  const output = await loadCanvasFromDataUrl(payload.image);
+  return restoreCanvasAlpha(imageCanvas, output);
 }
 
 function selectedSliceProcessBounds(frame, side, rect, outsidePx) {
@@ -4105,16 +6269,52 @@ function selectedSliceProcessBounds(frame, side, rect, outsidePx) {
   };
 }
 
+async function makeProcessedSlicePatch(selected, preset, insidePx, outsidePx, sourceCanvas, report = () => {}) {
+  const axis = sideAxis(selected.side);
+  const offsetSpan = axis === "x" ? selected.rect.w : selected.rect.h;
+  const offset = Math.floor(offsetSpan / 2);
+  const sheetRect = frameSheetRect(selected.frame, selected.rect);
+  let seamlessSlice = cropCanvas(sourceCanvas, sheetRect);
+
+  const insideMask = createInsideMask(seamlessSlice.width, seamlessSlice.height, axis, insidePx);
+  if (insideMask && offset > 0) {
+    report("making the repeat seamless");
+    const offsetSlice = offsetCanvas1d(seamlessSlice, axis, offset);
+    const inpaintedOffset = await runGmicInpaint(offsetSlice, insideMask, preset);
+    seamlessSlice = offsetCanvas1d(inpaintedOffset, axis, -offset);
+  }
+
+  const { bounds, slice } = selectedSliceProcessBounds(selected.frame, selected.side, selected.rect, outsidePx);
+  let patchCanvas = cropCanvas(sourceCanvas, bounds);
+  patchCanvas.getContext("2d").drawImage(seamlessSlice, slice.x, slice.y);
+
+  const outsideMask = createOutsideMask(patchCanvas.width, patchCanvas.height, axis, slice, outsidePx);
+  if (outsideMask) {
+    report("blending outside pixels");
+    patchCanvas = await runGmicInpaint(patchCanvas, outsideMask, preset);
+  }
+
+  return {
+    frameId: selected.frame.id,
+    side: selected.side,
+    index: selected.index,
+    x: bounds.x,
+    y: bounds.y,
+    w: bounds.w,
+    h: bounds.h,
+    canvas: patchCanvas,
+    preset,
+    insidePx,
+    outsidePx,
+  };
+}
+
 async function processSelectedSlice(preset) {
   const selected = getSelectedSliceRun();
   if (!selected || state.processingBusy) return;
   const label = PROCESS_PRESETS[preset] || preset;
   const insidePx = clamp(Number(els.processInsidePx?.value || 0), 0, 128);
   const outsidePx = clamp(Number(els.processOutsidePx?.value || 0), 0, 128);
-  const axis = sideAxis(selected.side);
-  const offsetSpan = axis === "x" ? selected.rect.w : selected.rect.h;
-  const offset = Math.floor(offsetSpan / 2);
-
   state.processingBusy = true;
   renderProcessingPane();
   setProcessingStatus(`${label}: preparing ${selected.name}...`);
@@ -4123,40 +6323,15 @@ async function processSelectedSlice(preset) {
     state.processedPatches.delete(selected.key);
     rebuildProcessedCanvas(false);
     const sourceCanvas = getRenderCanvas();
-    const sheetRect = frameSheetRect(selected.frame, selected.rect);
-    let seamlessSlice = cropCanvas(sourceCanvas, sheetRect);
-
-    const insideMask = createInsideMask(seamlessSlice.width, seamlessSlice.height, axis, insidePx);
-    if (insideMask && offset > 0) {
-      setProcessingStatus(`${label}: making slice seamless...`);
-      const offsetSlice = offsetCanvas1d(seamlessSlice, axis, offset);
-      const inpaintedOffset = await runGmicInpaint(offsetSlice, insideMask, preset);
-      seamlessSlice = offsetCanvas1d(inpaintedOffset, axis, -offset);
-    }
-
-    const { bounds, slice } = selectedSliceProcessBounds(selected.frame, selected.side, selected.rect, outsidePx);
-    let patchCanvas = cropCanvas(sourceCanvas, bounds);
-    patchCanvas.getContext("2d").drawImage(seamlessSlice, slice.x, slice.y);
-
-    const outsideMask = createOutsideMask(patchCanvas.width, patchCanvas.height, axis, slice, outsidePx);
-    if (outsideMask) {
-      setProcessingStatus(`${label}: blending outside pixels...`);
-      patchCanvas = await runGmicInpaint(patchCanvas, outsideMask, preset);
-    }
-
-    state.processedPatches.set(selected.key, {
-      frameId: selected.frame.id,
-      side: selected.side,
-      index: selected.index,
-      x: bounds.x,
-      y: bounds.y,
-      w: bounds.w,
-      h: bounds.h,
-      canvas: patchCanvas,
+    const patch = await makeProcessedSlicePatch(
+      selected,
       preset,
       insidePx,
       outsidePx,
-    });
+      sourceCanvas,
+      (stage) => setProcessingStatus(`${label}: ${stage}...`),
+    );
+    state.processedPatches.set(selected.key, patch);
     rebuildProcessedCanvas(false);
     setProcessingStatus(`${label}: applied to ${selected.name}.`);
   } catch (error) {
@@ -4310,6 +6485,15 @@ function findRectEdgeHandle(point, rect, threshold) {
   return candidates[0]?.handle || null;
 }
 
+// True when a handle resizes the run along its edge (its length) rather than its
+// cross extent (thickness). Top/bottom runs run horizontally, so left/right are
+// length; left/right runs run vertically, so top/bottom are length.
+function isAlongHandle(side, handle) {
+  return side === "top" || side === "bottom"
+    ? handle === "left" || handle === "right"
+    : handle === "top" || handle === "bottom";
+}
+
 function findAreaSideAtPoint(point, areas) {
   const candidates = EDGE_SIDES
     .map((side) => ({ side, rect: areas[side] }))
@@ -4336,6 +6520,9 @@ function findEditableEntryHit(point, entries, kind, handleThreshold) {
   for (const entry of entries) {
     const handle = findRectEdgeHandle(point, entry.rect, edgeThreshold);
     if (!handle) continue;
+    // A slice's thickness is derived from transparency, not user-draggable — only
+    // expose handles that change its length. (Medallions stay fully resizable.)
+    if (kind === "slice" && !isAlongHandle(entry.side, handle)) continue;
     const distance = handle === "left" || handle === "right"
       ? Math.abs(point.x - (handle === "left" ? entry.rect.x : entry.rect.x + entry.rect.w))
       : Math.abs(point.y - (handle === "top" ? entry.rect.y : entry.rect.y + entry.rect.h));
@@ -4402,6 +6589,10 @@ function refreshAutoMedallions(frame, areas) {
   if (areas.fixedRunsExplicit === true) return;
   const detected = detectMedallions(frame, areas);
   for (const side of EDGE_SIDES) {
+    if (areas.hiddenMedallionSides?.[side] === true) {
+      delete detected[side];
+      continue;
+    }
     if (areas.fixedRunsExplicitSides?.[side] === true && areas.medallions?.[side]) {
       detected[side] = areas.medallions[side];
     }
@@ -4556,7 +6747,7 @@ function addSliceAt(side, point) {
   const areas = getSelectedAreas();
   if (!frame || !areas || !areas[side]) return;
   clearProcessedFrame(frame.id, false);
-  const rect = defaultEditableRunRect(areas, side, point);
+  const rect = fitSliceCross(frame, side, defaultEditableRunRect(areas, side, point), areas);
   areas.tileRuns ||= {};
   areas.tileRuns[side] ||= [];
   areas.tileRuns[side].push(rect);
@@ -4569,7 +6760,7 @@ function setSliceRun(side, index, rect) {
   if (!frame || !areas || !areas[side] || !areas.tileRuns?.[side]?.[index]) return;
   clearProcessedSlice(frame.id, side, index, false);
   const runs = areas.tileRuns[side].map(cloneRect);
-  runs[index] = clampRectInside(rect, areas[side]);
+  runs[index] = fitSliceCross(frame, side, clampRectInside(rect, areas[side]), areas);
   areas.tileRuns[side] = runs;
   setConstrainedAreas(frame, areas);
 }
@@ -4583,6 +6774,19 @@ function deleteSliceRun(side, index) {
     clearSelectedSlice(false);
   }
   areas.tileRuns[side].splice(index, 1);
+  areas.tileRuns = cleanRunCollection(areas.tileRuns, side);
+  setConstrainedAreas(frame, areas);
+}
+
+function deleteAllSlicesOnSide(side) {
+  const frame = getSelectedFrame();
+  const areas = getSelectedAreas();
+  if (!frame || !areas || !areas.tileRuns?.[side]?.length) return;
+  clearProcessedFrame(frame.id, false);
+  if (state.selectedSlice?.kind === "slice" && state.selectedSlice?.frameId === frame.id && state.selectedSlice.side === side) {
+    clearSelectedSlice(false);
+  }
+  areas.tileRuns[side] = [];
   areas.tileRuns = cleanRunCollection(areas.tileRuns, side);
   setConstrainedAreas(frame, areas);
 }
@@ -4717,6 +6921,7 @@ function getFrameExportSettings(frame) {
     detection: current.detection,
     areas: saved.areas || current.areas,
     previewMode: current.previewMode,
+    centerMedallions: current.centerMedallions,
   };
 }
 
@@ -4725,6 +6930,13 @@ function serializePatch(frame) {
   const areas = state.edgeAreas.get(frame.id) || suggestEdgeAreas(frame);
   const corners = getCornerSourceAreas(frame, areas);
   const mode = state.previewMode === "mirror" ? "mirror" : state.previewMode;
+  const sideMode = (side) => {
+    const configuredMode = areas.sideModes?.[side] || mode;
+    return areas.hiddenMedallionSides?.[side] === true && configuredMode === "stretch"
+      ? "tile_stretch"
+      : configuredMode;
+  };
+  const backgroundRect = findInteriorTransparentBounds(frame);
   return {
     format: "transparent-edge-frame",
     version: 1,
@@ -4732,12 +6944,14 @@ function serializePatch(frame) {
     image: state.imageName,
     sourceRect: [frame.x, frame.y, frame.w, frame.h],
     transparentCenter: rectToArray(areas.center),
-    backgroundRect: rectToArray(findInteriorTransparentBounds(frame)),
+    backgroundRect: rectToArray(backgroundRect),
+    insideRect: rectToArray(findInsideRect(frame, backgroundRect)),
+    centerMedallions: state.centerMedallions,
     areas: {
-      top: serializeEdgeSide(frame, areas, "top", "x", mode),
-      bottom: serializeEdgeSide(frame, areas, "bottom", "x", mode),
-      left: serializeEdgeSide(frame, areas, "left", "y", mode),
-      right: serializeEdgeSide(frame, areas, "right", "y", mode),
+      top: serializeEdgeSide(frame, areas, "top", "x", sideMode("top")),
+      bottom: serializeEdgeSide(frame, areas, "bottom", "x", sideMode("bottom")),
+      left: serializeEdgeSide(frame, areas, "left", "y", sideMode("left")),
+      right: serializeEdgeSide(frame, areas, "right", "y", sideMode("right")),
       corners: {
         topLeft: rectToArray(corners.topLeft),
         topRight: rectToArray(corners.topRight),
@@ -4745,7 +6959,9 @@ function serializePatch(frame) {
         bottomRight: rectToArray(corners.bottomRight),
       },
       medallions: Object.fromEntries(
-        Object.entries(areas.medallions || {}).map(([side, rect]) => [side, rectToArray(expandRunFullCross(frame, side, rect, areas.center))]),
+        Object.entries(areas.medallions || {})
+          .filter(([side]) => areas.hiddenMedallionSides?.[side] !== true)
+          .map(([side, rect]) => [side, rectToArray(expandRunFullCross(frame, side, rect, areas.center))]),
       ),
     },
     colors: {
@@ -4785,12 +7001,16 @@ function serializePatch(frame) {
 
 function serializeEdgeSide(frame, areas, side, axis, mode) {
   const data = { source: rectToArray(areas[side]), axis, mode };
-  const runs = areas.tileRuns?.[side] || [];
+  // Slices export at their full opaque cross extent (thickness is transparency-
+  // derived, never user-set), so the runtime draws what the editor previews —
+  // including auto-detected slices that were never manually fitted.
+  const runs = (areas.tileRuns?.[side] || []).map((r) => expandRunFullCross(frame, side, r, areas.center));
   if (runs.length > 0) data.tileRuns = runs.map(rectToArray);
   // Fixed runs (ornaments/gems) are exported at their FULL cross height so the
   // runtime can draw them sticking out past the thin edge strip without scanning
   // pixels itself. The detected runs are clamped to the strip, so expand here.
-  const fixedRuns = (areas.fixedRuns?.[side] || []).map((r) => expandRunFullCross(frame, side, r, areas.center));
+  const fixedRuns = (areas.hiddenMedallionSides?.[side] ? [] : (areas.fixedRuns?.[side] || []))
+    .map((r) => expandRunFullCross(frame, side, r, areas.center));
   if (fixedRuns.length > 0) data.fixedRuns = fixedRuns.map(rectToArray);
   return data;
 }
@@ -4908,6 +7128,135 @@ function buildZipBlob(entries) {
   return new Blob(chunks, { type: "application/zip" });
 }
 
+// Snapshot of the current image's lossless storage record, used as the
+// authoritative payload when re-importing a project ZIP. saveCurrentImageState()
+// guarantees the localStorage record reflects the live editor before we read it.
+function buildProjectPayload() {
+  saveCurrentImageState();
+  const record = getStoredImageRecord() || { settings: getUiSettings(), frames: {} };
+  return {
+    format: "frame-patch-lab-project",
+    version: 1,
+    image: state.imageName,
+    record,
+  };
+}
+
+// Inflate a raw DEFLATE stream (ZIP method 8) using the browser's built-in
+// DecompressionStream. Our own exports are stored uncompressed (method 0), but
+// a user could re-zip with compression, so support both.
+async function inflateRaw(bytes) {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("This browser cannot read compressed ZIP entries.");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// Minimal ZIP reader (counterpart to buildZipBlob). Walks the central directory
+// so it works on any well-formed ZIP, returning a Map of filename -> bytes.
+async function readZipEntries(buffer) {
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  let eocd = -1;
+  for (let i = buffer.byteLength - 22; i >= 0; i -= 1) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("Not a ZIP file.");
+  const count = view.getUint16(eocd + 10, true);
+  let ptr = view.getUint32(eocd + 16, true);
+  const decoder = new TextDecoder();
+  const entries = new Map();
+  for (let n = 0; n < count; n += 1) {
+    if (ptr + 46 > buffer.byteLength || view.getUint32(ptr, true) !== 0x02014b50) break;
+    const method = view.getUint16(ptr + 10, true);
+    const compSize = view.getUint32(ptr + 20, true);
+    const nameLen = view.getUint16(ptr + 28, true);
+    const extraLen = view.getUint16(ptr + 30, true);
+    const commentLen = view.getUint16(ptr + 32, true);
+    const localOffset = view.getUint32(ptr + 42, true);
+    const name = decoder.decode(bytes.subarray(ptr + 46, ptr + 46 + nameLen));
+    const lhNameLen = view.getUint16(localOffset + 26, true);
+    const lhExtraLen = view.getUint16(localOffset + 28, true);
+    const dataStart = localOffset + 30 + lhNameLen + lhExtraLen;
+    const comp = bytes.subarray(dataStart, dataStart + compSize);
+    if (method === 0) entries.set(name, comp.slice());
+    else if (method === 8) entries.set(name, await inflateRaw(comp));
+    ptr += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+function decodeZipJson(entries, name) {
+  if (!name || !entries.has(name)) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(entries.get(name)));
+  } catch {
+    return null;
+  }
+}
+
+// Load a previously exported project ZIP and restore the full editing session:
+// settings, frames, patches, per-frame overrides, and the source image. The
+// restore itself rides on the existing localStorage + detectFrames() machinery —
+// we seed the storage record, then activating the image replays it.
+async function importProjectZip(file) {
+  if (!file) return;
+  setStatus(`Reading ${file.name}...`);
+  let entries;
+  try {
+    entries = await readZipEntries(await file.arrayBuffer());
+  } catch (error) {
+    setStatus(`Could not read ${file.name}: ${error.message || "not a valid ZIP."}`);
+    return;
+  }
+
+  const names = [...entries.keys()];
+  const project = decodeZipJson(entries, names.find((n) => n.endsWith("project.json")));
+  const patches = decodeZipJson(entries, names.find((n) => n.endsWith("patches.json")));
+
+  // Prefer the un-keyed source image so processing re-derives cleanly; fall back
+  // to the processed sheet (older exports) or any PNG in the archive.
+  const imageEntry = names.find((n) => n.endsWith(".source.png"))
+    || names.find((n) => n.endsWith(".processed.png"))
+    || names.find((n) => /\.png$/i.test(n));
+  if (!imageEntry) {
+    setStatus(`${file.name} has no image to load.`);
+    return;
+  }
+
+  const name = project?.image
+    || patches?.image
+    || imageEntry.replace(/\.(source|processed)\.png$/i, ".png").replace(/^.*\//, "");
+
+  // Seed the storage record so detectFrames()'s restore pass finds it, keyed by
+  // the same image name the export used.
+  const record = project?.record
+    || (patches?.settings ? { settings: patches.settings, frames: {} } : null);
+  if (record) {
+    flushPendingSave();
+    const root = readStorageRoot();
+    root.images ||= {};
+    root.images[name] = record;
+    writeStorageRoot(root);
+  }
+
+  const blob = new Blob([entries.get(imageEntry)], { type: "image/png" });
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onload = () => {
+    activateImage(img, name);
+    URL.revokeObjectURL(url);
+    const frameCount = record?.frames ? Object.keys(record.frames).length : 0;
+    setStatus(`Imported ${name}${frameCount ? ` — ${frameCount} saved frame${frameCount === 1 ? "" : "s"}` : ""}.`);
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    setStatus(`Could not load the image inside ${file.name}.`);
+  };
+  img.src = url;
+}
+
 function downloadCurrentCrop() {
   downloadFrameCrop(getSelectedFrame());
 }
@@ -4955,6 +7304,11 @@ Files in this archive:
   <image>.<frame>.png     One cropped PNG per detected frame (raw images, not
                           needed by MultiPatchFrame which uses the sheet).
   <image>.patches.json    Every frame's patch data ({ frames: [ ... ] }).
+  <image>.source.png      The original, un-keyed image. Not needed by Godot;
+                          used by Frame Patch Lab's "Load Project ZIP" to
+                          re-open and keep editing this project.
+  <image>.project.json    Lossless editor state for "Load Project ZIP".
+                          Not needed by Godot.
 
 Godot usage:
   1. Copy MultiPatchFrame.gd (and MultiPatchFrameLoader.gd) into your project.
@@ -4985,6 +7339,14 @@ async function downloadAll() {
     if (bytes) entries.push({ name: `${base}.${frameFileBase(frame)}.png`, data: bytes });
   }
 
+  // Original (un-keyed) source pixels so the project can be re-imported and
+  // fully re-processed from settings. Without this we'd only have the already
+  // keyed/recolored sheet, which can't be cleanly re-edited.
+  if (state.originalCanvas && state.originalCanvas.width && state.originalCanvas.height) {
+    const sourceBytes = await canvasToPngBytes(state.originalCanvas);
+    if (sourceBytes) entries.push({ name: `${base}.source.png`, data: sourceBytes });
+  }
+
   const payload = {
     image: state.imageName,
     generatedBy: "Frame Patch Lab",
@@ -4993,6 +7355,11 @@ async function downloadAll() {
   };
   const encoder = new TextEncoder();
   entries.push({ name: `${base}.patches.json`, data: encoder.encode(JSON.stringify(payload, null, 2)) });
+  // Full-fidelity, lossless project record (the in-app storage format). This is
+  // what "Load Project ZIP" reads back to restore every setting, frame, patch,
+  // and per-frame override exactly. The .patches.json above is the export/runtime
+  // format and is intentionally lossy, so we ship both.
+  entries.push({ name: `${base}.project.json`, data: encoder.encode(JSON.stringify(buildProjectPayload(), null, 2)) });
   entries.push({ name: "README.txt", data: encoder.encode(ZIP_README) });
 
   if (entries.length === 0) {
@@ -5062,11 +7429,17 @@ function showEditorContextMenu(event) {
     ? `Delete ${context.medallionHit.side} medallion ${context.medallionHit.index + 1}`
     : "Delete Medallion";
   const sideLabel = context.side ? `${context.side} ` : "";
+  const areas = getSelectedAreas();
+  const sideSliceCount = context.side ? (areas?.tileRuns?.[context.side]?.length || 0) : 0;
+  const deleteAllLabel = context.side
+    ? `Delete all ${context.side} slices (${sideSliceCount})`
+    : "Delete all slices on side";
   const menu = els.editorContextMenu;
   menu.innerHTML = "";
   addContextMenuButton(menu, `Add ${sideLabel}slice`, Boolean(context.side), () => addSliceAt(context.side, context.point));
   addContextMenuButton(menu, `Add ${sideLabel}medallion`, Boolean(context.side), () => addMedallionAt(context.side, context.point));
   addContextMenuButton(menu, sliceLabel, Boolean(context.sliceHit), () => deleteSliceRun(context.sliceHit.side, context.sliceHit.index));
+  addContextMenuButton(menu, deleteAllLabel, sideSliceCount > 0, () => deleteAllSlicesOnSide(context.side));
   addContextMenuButton(menu, medallionLabel, Boolean(context.medallionHit), () => deleteMedallionRun(context.medallionHit.side, context.medallionHit.index));
 
   menu.hidden = false;
@@ -5078,10 +7451,16 @@ function showEditorContextMenu(event) {
 }
 
 function installEvents() {
-  els.imageSelect.addEventListener("change", () => loadImage(els.imageSelect.value, els.imageSelect.value));
+  els.imageSelect.addEventListener("change", () => loadBuiltinImageSelection(els.imageSelect.value));
+  els.matchSeriesSaturation?.addEventListener("change", recomposeCurrentImageSeries);
   els.fileInput.addEventListener("change", () => {
     loadImageFiles(els.fileInput.files);
     els.fileInput.value = "";
+  });
+  els.importZipInput?.addEventListener("change", () => {
+    const file = els.importZipInput.files?.[0];
+    if (file) importProjectZip(file);
+    els.importZipInput.value = "";
   });
   els.autoColorsBtn.addEventListener("click", () => {
     if (!state.originalData) return;
@@ -5118,12 +7497,24 @@ function installEvents() {
       scheduleSaveCurrentImageState();
     });
   });
-  [els.sliceThreshold, els.sliceBridgeGap, els.sliceCornerGuard, els.sliceLengthLimit].forEach((input) => {
+  [els.sliceThreshold, els.sliceBridgeGap, els.sliceCornerGuard, els.sliceLengthLimit, els.maxMedallions].forEach((input) => {
     input?.addEventListener("input", () => {
       updateSliceScanControls();
       rememberFrameSettings();
       scheduleSaveCurrentImageState();
     });
+  });
+  els.insidePercentile?.addEventListener("input", () => {
+    updateControlLabels();
+    rememberFrameSettings();
+    drawEditor();
+    scheduleSaveCurrentImageState();
+  });
+  els.showInsideRect?.addEventListener("change", drawEditor);
+  els.centerMedallions?.addEventListener("change", () => {
+    state.centerMedallions = els.centerMedallions.checked;
+    renderAll();
+    scheduleSaveCurrentImageState();
   });
   els.autoSideInputs?.forEach((input) => {
     input.addEventListener("change", () => {
@@ -5149,6 +7540,23 @@ function installEvents() {
     scheduleSaveCurrentImageState();
     renderAll();
   });
+  els.wizardBtn?.addEventListener("click", openWizard);
+  els.wizardRefreshBtn?.addEventListener("click", refreshWizardCandidates);
+  els.wizardLongBtn?.addEventListener("click", refreshLongWizardCandidates);
+  els.wizardBreedBtn?.addEventListener("click", breedWizardCandidates);
+  els.wizardClearBtn?.addEventListener("click", clearWizardParents);
+  els.wizardLimitMedallions?.addEventListener("change", () => {
+    setWizardMedallionLimit(els.wizardLimitMedallions.checked);
+  });
+  els.wizardMaxMedallions?.addEventListener("change", () => {
+    setWizardMaxMedallions(els.wizardMaxMedallions.value);
+  });
+  document.querySelectorAll("[data-wizard-scale]").forEach((button) => {
+    button.addEventListener("click", () => setWizardPreviewScale(button.dataset.wizardScale));
+  });
+  // Closing only hides the wizard. Candidates, kept parents, generation, and
+  // already accepted frames remain available when Wizard is opened again.
+  els.wizardCloseBtn?.addEventListener("click", () => closeWizard(false));
   els.gridViewBtn?.addEventListener("click", openGridView);
   els.gridViewCloseBtn?.addEventListener("click", () => closeGridView(true));
   els.gridApplyCurrentBtn?.addEventListener("click", () => {
@@ -5289,12 +7697,48 @@ function installEvents() {
     hideEditorContextMenu();
   });
   document.addEventListener("keydown", (event) => {
+    if (state.wizard.visible && event.key === "Shift") {
+      setWizardSideAssemblyActive(true);
+      return;
+    }
+    if (state.wizard.visible && event.key === "Control") {
+      setWizardMedallionsHidden(true);
+      return;
+    }
+    if (state.wizard.visible && event.code === "Space") {
+      event.preventDefault();
+      if (!event.repeat) els.wizardBreedBtn?.click();
+      return;
+    }
+    if (state.wizard.visible && event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      if (!event.repeat) els.wizardLongBtn?.click();
+      return;
+    }
+    if (state.wizard.visible && event.key === "Backspace") {
+      event.preventDefault();
+      if (!event.repeat) els.wizardRefreshBtn?.click();
+      return;
+    }
     if (event.key !== "Escape") return;
+    if (state.wizard.visible) {
+      event.preventDefault();
+      clearWizardParents();
+      return;
+    }
     if (state.gridView.visible) {
       closeGridView(true);
       return;
     }
     hideEditorContextMenu();
+  });
+  document.addEventListener("keyup", (event) => {
+    if (event.key === "Shift") setWizardSideAssemblyActive(false);
+    if (event.key === "Control") setWizardMedallionsHidden(false);
+  });
+  window.addEventListener("blur", () => {
+    setWizardSideAssemblyActive(false);
+    setWizardMedallionsHidden(false);
   });
   window.addEventListener("dragenter", (event) => {
     if (!isFileDrag(event.dataTransfer)) return;
@@ -5319,10 +7763,14 @@ function installEvents() {
     document.body.classList.remove("drag-over");
     loadImageFiles(event.dataTransfer.files);
   });
-  window.addEventListener("resize", hideEditorContextMenu);
+  window.addEventListener("resize", () => {
+    hideEditorContextMenu();
+    if (state.wizard.visible) window.requestAnimationFrame(renderWizardCanvases);
+  });
   window.addEventListener("beforeunload", flushPendingSave);
 }
 
-initImageOptions();
 installEvents();
-loadImage(BUILTIN_IMAGES[0], BUILTIN_IMAGES[0]);
+initImageOptions().then(() => {
+  if (els.imageSelect.value) loadBuiltinImageSelection(els.imageSelect.value);
+});
